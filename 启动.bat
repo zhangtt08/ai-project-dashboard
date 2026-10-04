@@ -13,13 +13,13 @@ echo Desktop app not built yet - starting the browser version instead.
 echo Rebuild it with: powershell -File desktop\build.ps1
 echo.
 
-if exist "data\server-url.txt" del /q "data\server-url.txt" >/dev/null 2>&1
+if exist "data\server-url.txt" del /q "data\server-url.txt" >nul 2>&1
 start "AI-Project-Commander-Server" /min cmd /c "node src\server\cli.js start"
 
 set /a tries=0
 :waiturl
 if exist "data\server-url.txt" goto open
-timeout /t 1 /nobreak >/dev/null
+timeout /t 1 /nobreak >nul
 set /a tries+=1
 if %tries% lss 40 goto waiturl
 echo Server did not start within 40 seconds. Check the server window for errors.
