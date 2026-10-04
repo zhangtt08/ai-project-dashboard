@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { normalizeError, NotFoundError, ValidationError } from '../domain/errors.js';
 import { logger } from '../core/logger.js';
 import { toPosix } from '../core/util.js';
+import { createLocalGuard, guardPayload } from './local-guard.js';
 
 const log = logger.child('http');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -116,28 +117,37 @@ function serveStatic(req, res, pathname) {
   return true;
 }
 
-export function createHttpServer({ router, app, cors = false }) {
+export function createHttpServer({ router, app, guard = null } = {}) {
+  // The loopback guard is unconditional. There used to be a `cors` option here that set
+  // `access-control-allow-origin: *` and skipped the origin check; no caller passed it, and a
+  // wildcard on a state-changing local API is exactly the hole this module closes, so the
+  // option is gone rather than defaulted off.
+  const localGuard = guard === false ? null : (guard || createLocalGuard());
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
     let pathname = '';
 
-    if (cors) {
-      res.setHeader('access-control-allow-origin', '*');
-      res.setHeader('access-control-allow-methods', 'GET,POST,PATCH,PUT,DELETE,OPTIONS');
-      res.setHeader('access-control-allow-headers', 'content-type');
-    }
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
     try {
       const url = new URL(req.url, 'http://localhost');
       pathname = toPosix(url.pathname);
-      if (!cors && req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) {
-        sendJson(res, 403, { error: { code: 'forbidden', message: 'cross-origin request denied' } });
+
+      const verdict = localGuard ? localGuard(req, url) : null;
+      if (verdict) {
+        log.warn('guard_denied', { method: req.method, host: req.headers.host, origin: req.headers.origin || null, code: verdict.code, status: verdict.status });
+        sendJson(res, verdict.status, guardPayload(verdict));
         return;
       }
+
+      if (req.method === 'OPTIONS') {
+        // Preflight only for our own origin; anything else was refused above.
+        res.writeHead(204, { vary: 'Origin' });
+        res.end();
+        return;
+      }
+
       if (pathname.startsWith('/api/')) {
         const matched = router.match(req.method, pathname);
-        if (!matched) { sendJson(res, 404, { error: { code: 'not_found', message: `no route for ${req.method} ${pathname}` } }); return; }
+        if (!matched) { sendJson(res, 404, apiErrorPayload(pathname, { code: 'not_found', message: `no route for ${req.method} ${pathname}` })); return; }
         const query = Object.fromEntries(url.searchParams.entries());
         const body = ['POST', 'PATCH', 'PUT'].includes(req.method) ? await readJsonBody(req) : {};
         const result = await matched.route.handler({ params: matched.params, query, body, req, res, app });
@@ -165,7 +175,11 @@ export function createHttpServer({ router, app, cors = false }) {
       const e = normalizeError(err);
       if (err.closeConnection) res.setHeader('connection', 'close');
       log.warn('request_failed', { method: req.method, path: pathname, code: e.code, status: e.status, message: e.message });
-      if (!res.writableEnded) sendJson(res, e.status, { error: e.toJSON() });
+      if (!res.writableEnded) {
+        const body = apiErrorPayload(pathname, e.toJSON());
+        if (pathname.startsWith('/api/agent/')) body.error.available = agentToolNames(app);
+        sendJson(res, e.status, body);
+      }
     } finally {
       log.debug('request', { method: req.method, path: pathname, ms: Date.now() - started });
     }
@@ -192,4 +206,25 @@ export function requireParam(body, name, { type = 'string', maxLength = 5000 } =
 }
 
 export function notFound(what, id) { throw new NotFoundError(what, id); }
+
+/**
+ * Error body shaping, in one place.
+ *
+ * The app's own REST surface has always returned `{error:{code,message,hint}}` and its web UI
+ * reads `payload.error.message`, so that shape stays. The four Agent-contract endpoints must
+ * instead return `{ok:false,error:{code,message}}` (docs/AGENT_API_STANDARD.md), and a
+ * bare `{error}` there is a contract violation a tool caller cannot parse — which is exactly
+ * what a malformed JSON body or an unmatched /api/agent/* route would otherwise produce.
+ */
+export function apiErrorPayload(pathname, error) {
+  if (typeof pathname === 'string' && pathname.startsWith('/api/agent/')) return { ok: false, error };
+  return { error };
+}
+
+/** The tool-name list attached to agent-path failures, from the container, never hardcoded here. */
+function agentToolNames(app) {
+  const list = app && app.agentApi && app.agentApi.available;
+  return Array.isArray(list) ? list.slice() : [];
+}
+
 export { sendJson, WEB_ROOT };

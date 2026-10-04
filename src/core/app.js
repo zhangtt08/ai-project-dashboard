@@ -816,6 +816,15 @@ export class App {
   securityModel() {
     return {
       commandRunner: describeSecurityModel(),
+      transport: {
+        bind: '127.0.0.1 only —— 非回环的 --host 直接拒绝启动（src/server/cli.js）',
+        hostAllowlist: 'Host 必须是 127.0.0.1 / localhost / [::1] 加上本机实际监听端口；判据用 req.socket.localPort，不拿请求自带的 Host 去对照 Origin（那是 DNS rebinding 的成因）',
+        originPolicy: '带 Origin 或 Referer 的请求必须与本服务同源同端口；跨源写入一律 403。没有 access-control-allow-origin：这个 API 不向任何第三方页面开放',
+        localToken: process.env.COMMANDER_LOCAL_TOKEN
+          ? '已启用：非 GET 请求必须带 x-commander-token / Authorization: Bearer / ?token=，用 timingSafeEqual 比对；令牌镜像在数据目录 local-token.txt（0600）'
+          : '未启用：设置环境变量 COMMANDER_LOCAL_TOKEN 后，所有非 GET 请求都要带本机令牌（浏览器界面不受影响，它本来就是同源）',
+        decisionFunction: 'src/server/local-guard.js:guardRequest —— 一处判定，测试见 tests/integration/local-guard.test.js',
+      },
       sensitiveFiles: {
         policy: '敏感文件的内容绝不会被读取、存储、记录日志或发送给任何 AI 提供方。',
         patterns: SENSITIVE_PATTERNS.map((p) => ({ pattern: p.pattern, rule: p.rule })),

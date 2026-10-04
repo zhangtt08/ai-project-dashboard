@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { App } from '../core/app.js';
 import { buildRouter } from './routes.js';
 import { createHttpServer, WEB_ROOT } from './http-server.js';
+import { createLocalGuard, isLoopbackAddress, localTokenFile } from './local-guard.js';
 import { logger } from '../core/logger.js';
 import { checkSyntaxAll } from '../../tools/syntax.js';
 
@@ -34,9 +35,31 @@ function parseArgs(argv) {
 async function serve(args) {
   const port = Number(args.port || process.env.PORT || 8787);
   const host = args.host || '127.0.0.1';
+  // Binding is loopback-only, by policy and not by convention. A guard that checks Host and
+  // Origin is worth nothing if the socket also listens on the LAN, and the standard this
+  // project is delivered against forbids 0.0.0.0 outright — so a non-loopback --host is a
+  // startup error, not a warning.
+  if (!isLoopbackAddress(host)) {
+    process.stderr.write(`\n  Refusing to bind ${host}:${port}.\n  ` + 'Commander 只监听 127.0.0.1 / localhost / [::1]：这套 API 没有账号体系，本机回环就是它的安全边界。\n\n');
+    process.exit(2);
+  }
   const app = new App({ dataDir: process.env.COMMANDER_DATA_DIR || undefined, logLevel: args.verbose ? 'debug' : (process.env.COMMANDER_LOG_LEVEL || 'info') });
   const router = buildRouter(app);
-  const server = createHttpServer({ router, app });
+  const guard = createLocalGuard();
+  const server = createHttpServer({ router, app, guard });
+  // Mirror the configured secret into the data dir so the desktop shell and the MCP bridge can
+  // discover it with zero user setup. No file, no requirement: the browser SPA cannot read it,
+  // so the token stays opt-in (see src/server/local-guard.js).
+  if (guard.tokenRequired) {
+    try {
+      const file = localTokenFile(app.dataDir);
+      fs.writeFileSync(file, String(process.env.COMMANDER_LOCAL_TOKEN || '').trim(), { encoding: 'utf8', mode: 0o600 });
+      try { fs.chmodSync(file, 0o600); } catch { /* Windows: ACLs, not mode bits — see README */ }
+      logger.info('local_token_file', { file });
+    } catch (err) {
+      logger.warn('local_token_file_failed', { error: err.message });
+    }
+  }
   app.startBackground();
   const backfilled = app.backfillClassification();
   if (backfilled) logger.info('classification_backfilled', { projects: backfilled });
