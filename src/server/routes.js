@@ -1,6 +1,7 @@
 /** API surface. Handlers stay thin: validate → call the container → return data. */
 import { Router, requireParam, sendJson } from './http-server.js';
-import { ValidationError, NotFoundError } from '../domain/errors.js';
+import { ValidationError, NotFoundError, CommanderError } from '../domain/errors.js';
+import { commandsAllowedFor, trustState } from '../core/trust.js';
 import { JOB_TYPE, DEFAULT_SCAN_LIMITS } from '../domain/constants.js';
 import { ManualImportAdapter, MockAgentAdapter, ADAPTER_CATALOGUE } from '../core/agent-sessions.js';
 import { analyzeChanges } from '../core/analyzers/change-analyzer.js';
@@ -208,11 +209,17 @@ export function buildRouter(app) {
   // Run a single pinned (or auto-detected) command without a full rescan. Uses the
   // existing BUILD / TEST job handlers, which go through CommandRunner's allowlist.
   r.post('/api/projects/:id/commands/run', ({ params, body }) => {
-    needProject(app, params.id);
+    const project = needProject(app, params.id);
     const kind = String(body.kind || 'build');
     const allowed = ['build', 'lint', 'typecheck', 'test', 'integrationTest', 'e2e'];
     if (!allowed.includes(kind)) {
       throw new ValidationError('未知命令类型', [{ path: 'kind', message: `必须是：${allowed.join('、')}` }]);
+    }
+    const gate = commandsAllowedFor(project, true);
+    if (!gate.allowed) {
+      throw new CommanderError('该项目尚未标记为可信，Commander 不会执行它的命令。', {
+        code: 'workspace_untrusted', status: 403, hint: gate.reason,
+      });
     }
     let job;
     if (kind === 'build' || kind === 'lint' || kind === 'typecheck') {
@@ -283,38 +290,71 @@ export function buildRouter(app) {
   r.post('/api/projects/:id/resume-watch', ({ params }) => { needProject(app, params.id); app.resumeWatch(params.id); return app.projectCard(app.getProject(params.id)); });
 
   // ── Scanning / jobs ─────────────────────────────────────────────────────
+  /**
+   * Trust gate, applied at the boundary: `runCommands` from the client is a *request*, and the
+   * project's trust is what decides. A scan of a folder nobody trusted still produces real
+   * metadata, git, specs, risks and health — it just never executes their scripts.
+   */
   r.post('/api/projects/:id/scan', ({ params, body }) => {
-    needProject(app, params.id);
+    const project = needProject(app, params.id);
     const mode = body.mode === 'quick' ? 'quick' : 'full';
     const type = mode === 'quick' ? JOB_TYPE.QUICK_SCAN : JOB_TYPE.FULL_SCAN;
+    const gate = commandsAllowedFor(project, body.runCommands !== false);
     // Clicking 重新扫描 twice must not start two builds in one directory: the second click gets
     // the job that is already queued, and `deduped` tells the UI to say so instead of "已入队".
     const job = app.queue.enqueue({
       projectId: params.id,
       type,
-      payload: { projectId: params.id, runCommands: body.runCommands !== false, suites: body.suites },
+      payload: { projectId: params.id, runCommands: gate.allowed, suites: body.suites },
       priority: body.priority !== undefined ? Number(body.priority) : 3,
       timeoutMs: mode === 'quick' ? 120000 : 900000,
       dedupe: true,
     });
-    return { jobId: job.id, mode, deduped: !!job.reused, status: job.status };
+    return {
+      jobId: job.id, mode, deduped: !!job.reused, status: job.status,
+      runCommands: gate.allowed,
+      commandsSkippedReason: gate.allowed ? null : gate.reason,
+      trusted: gate.trusted,
+    };
   });
 
   r.post('/api/projects/:id/scan-sync', async ({ params, body }) => {
-    needProject(app, params.id);
+    const project = needProject(app, params.id);
+    const gate = commandsAllowedFor(project, body.runCommands !== false);
     const mode = body.mode === 'quick' ? 'quick' : 'full';
     if (mode === 'quick') {
       const out = await app.orchestrator.quickScan(params.id);
       return { mode, files: out.metadata.fileCount, git: { branch: out.git.branch, clean: out.git.workingTreeClean } };
     }
-    const out = await app.orchestrator.fullScan(params.id, { runCommands: body.runCommands !== false, suites: body.suites || ['unit', 'integration', 'e2e'] });
+    const out = await app.orchestrator.fullScan(params.id, { runCommands: gate.allowed, suites: body.suites || ['unit', 'integration', 'e2e'] });
     return {
       mode, files: out.metadata.fileCount, health: out.health.status, gate: out.gate.result,
       snapshotSeq: out.snapshot.seq, durationMs: out.durationMs,
+      // null when the commands ran; otherwise the honest reason there is no build/test number.
+      commandsSkipped: out.commandsSkipped || (gate.allowed ? null : { code: 'workspace_untrusted', reason: gate.reason }),
       build: out.build.build ? out.build.build.status : null,
       unit: out.tests.unit ? `${out.tests.unit.passed}/${out.tests.unit.total}` : null,
       e2e: out.tests.e2e ? `${out.tests.e2e.passed}/${out.tests.e2e.total}` : null,
     };
+  });
+
+  r.get('/api/projects/:id/trust', ({ params }) => {
+    const project = needProject(app, params.id);
+    const gate = commandsAllowedFor(project, true);
+    return { ...trustState(project), wouldRunCommands: gate.allowed, reason: gate.reason };
+  });
+
+  /**
+   * The trust decision itself. Granting it needs `confirm: true`, because what it turns on is
+   * "run whatever this folder's package.json says" — a click, not a side effect of loading a page.
+   */
+  r.post('/api/projects/:id/trust', ({ params, body }) => {
+    needProject(app, params.id);
+    const trusted = body.trusted === true;
+    if (trusted && body.confirm !== true) {
+      throw new ValidationError('信任需要明确确认', [{ path: 'confirm', message: '必须传 confirm:true —— 这一步打开的是「执行该目录里的命令」' }]);
+    }
+    return app.setProjectTrust(params.id, trusted, { source: 'user' });
   });
 
   r.get('/api/jobs', ({ query }) => app.queue.list({ status: query.status || null, limit: Math.min(Number(query.limit || 50), 500) }));

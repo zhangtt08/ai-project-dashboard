@@ -46,6 +46,7 @@ import { ensureDemoProjects, demoProjectDefinitions } from '../demo/fixture-fact
 import { EVENT_TYPE, PROJECT_STATUS, PROJECT_HEALTH, DEFAULT_SCAN_LIMITS, SENSITIVE_PATTERNS } from '../domain/constants.js';
 import { newId, nowIso, toPosix } from './util.js';
 import { expandShortPath } from './fs-safe.js';
+import { commandsAllowedFor, trustPatch, trustState } from './trust.js';
 import { WorkspaceError, ConflictError, NotFoundError } from '../domain/errors.js';
 
 /** Thin adapters so engines expose a uniform `.detect()/.evaluate()` surface. */
@@ -185,7 +186,7 @@ export class App {
 
   // ───────────────────────────── Workspace Registry (#10) ─────────────────────────────
 
-  addProject({ workspacePath, name = null, description = '', ignorePatterns = [], demo = false, category = null }) {
+  addProject({ workspacePath, name = null, description = '', ignorePatterns = [], demo = false, category = null, trusted = false, trustedSource = 'import' }) {
     const abs = expandShortPath(path.resolve(workspacePath));
     if (!fs.existsSync(abs)) throw new WorkspaceError(`workspace path does not exist: ${abs}`, '请选择一个当前存在的本地目录。');
     if (!fs.statSync(abs).isDirectory()) throw new WorkspaceError(`workspace path is not a directory: ${abs}`, '路径指向的是文件，需要选择一个文件夹。');
@@ -202,6 +203,12 @@ export class App {
       health: PROJECT_HEALTH.UNKNOWN,
       is_demo: !!demo,
       watch_paused: false,
+      // Newly added from outside ⇒ no command execution until a person says otherwise.
+      // The full rule, including why pre-existing rows are already trusted, is in
+      // src/core/trust.js.
+      trusted: !!trusted,
+      trusted_at: trusted ? nowIso() : null,
+      trusted_source: trusted ? trustedSource : null,
       ignore_patterns: ignorePatterns,
       category: CATEGORY_KEYS.includes(category) ? category : 'uncategorized',
       category_manual: CATEGORY_KEYS.includes(category) ? 1 : 0,
@@ -250,6 +257,22 @@ export class App {
     }
     this.repo.update('projects', projectId, { metadata: meta });
     return clean;
+  }
+
+  /**
+   * The trust decision, and nothing else. Choosing NOT to run it here — no quick scan, no
+   * enqueue — is deliberate: a scan may take minutes and fail for reasons unrelated to trust,
+   * and "I trusted this folder" should never look like it silently launched their build.
+   * The row is the record; the next scan reads it through commandsAllowedFor().
+   */
+  setProjectTrust(projectId, trusted, { source = 'user' } = {}) {
+    this.getProject(projectId);
+    const patch = trustPatch(Boolean(trusted), { source });
+    const updated = this.repo.update('projects', projectId, patch);
+    this.events.record(projectId, EVENT_TYPE.NOTE, trusted ? 'Workspace marked trusted: scans may run detected commands' : 'Workspace trust revoked: scans will not run any command', {
+      trusted: Boolean(trusted), source: trusted ? source : null,
+    });
+    return { project: this.projectCard(updated), trust: trustState(this.repo.get('projects', projectId)) };
   }
 
   /** Manual 分类 wins over inference until the user clears it back to auto. */
@@ -634,7 +657,7 @@ export class App {
     for (const def of created) {
       const existing = this.repo.list('projects', { workspace_path: toPosix(def.dir) })[0];
       if (existing) { out.push({ project: existing, alreadyPresent: true }); continue; }
-      const project = this.addProject({ workspacePath: def.dir, name: def.name, description: def.description, demo: true });
+      const project = this.addProject({ workspacePath: def.dir, name: def.name, description: def.description, demo: true, trusted: true, trustedSource: 'demo' });
       for (const adr of AdrStore.seedFromProject({ ...project, primaryLanguage: 'unknown', framework: 'unknown', packageManager: 'unknown' })) {
         this.adrStore.create(project.id, adr);
       }
@@ -691,6 +714,10 @@ export class App {
       health: view.workspaceMissing ? PROJECT_HEALTH.UNKNOWN : project.health,
       isDemo: !!project.is_demo,
       watchPaused: !!project.watch_paused,
+      // Command execution is a recorded decision, so the card has to say which one it is.
+      trusted: commandsAllowedFor(project).trusted,
+      commandsAllowed: commandsAllowedFor(project).allowed,
+      trust: trustState(project),
       currentStage: (meta.stages && meta.stages.current) || meta.currentStageName || (this.repo.get('stages', project.current_stage_id || '') || {}).name || null,
       progress: project.progress || meta.progress || { value: null, reason: 'not computed' },
       build: meta.build || null,
@@ -830,6 +857,17 @@ export class App {
         patterns: SENSITIVE_PATTERNS.map((p) => ({ pattern: p.pattern, rule: p.rule })),
       },
       managedWorkspace: '只读 —— Commander 没有任何向受管工作区写入的代码路径（ADR-009）。',
+      projectTrust: {
+        rule: '扫描默认不执行工作区里的任何命令。只有被明确标记为「已信任」的项目才会跑检测到的构建/测试脚本。',
+        decisionFunction: 'src/core/trust.js:commandsAllowedFor —— 判据只有一处，routes 与 orchestrator 都调它',
+        whereTrustComesFrom: [
+          '这次改造之前就存在的项目行：MIGRATION_6 里标为已信任（来源记 trusted_source=migration），因为它们是本机这个人自己添加的；把它们悄悄改成「不出构建结果、不出测试结果」才是意外',
+          'Commander 自己生成的演示项目（<dataDir>/demo-projects，来源 demo）',
+          '用户在项目页点「信任并允许执行命令」（来源 user），或调用 Agent 工具 commander.project.trust',
+        ],
+        defaultForNewImports: '未信任（POST /api/projects、拖拽导入、发现导入、首屏自动导入都一样）',
+        revoked: '随时可以在项目页取消信任；取消后正在跑的任务会被下一次扫描尊重，本次扫描不会新起命令',
+      },
       aiDataBoundary: '仅发送路径、计数、统计、少量片段与失败信息。密钥在发送前会被脱敏。',
       secretsStorage: 'API 密钥保存在本地 SQLite 的设置表中，绝不会回传给前端。',
     };

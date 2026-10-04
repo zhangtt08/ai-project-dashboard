@@ -35,7 +35,7 @@ const JSON_COLS = {
 
 /** boolean columns stored as INTEGER 0/1. */
 const BOOL_COLS = {
-  projects: ['is_demo', 'watch_paused'],
+  projects: ['is_demo', 'watch_paused', 'trusted'],
   git_snapshots: ['is_repository', 'git_available', 'working_tree_clean'],
   build_results: ['truncated'],
   agent_sessions: ['is_mock'],

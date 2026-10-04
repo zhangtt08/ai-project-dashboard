@@ -75,7 +75,7 @@ export function openImportDialog(onDone = null) {
     },
   });
 
-  const hint = h('span', { class: 'muted small', text: '导入后立即扫描并自动归类；配置了 GitHub 令牌还会自动建私有仓库上传。' });
+  const hint = h('span', { class: 'muted small', text: '导入后立即扫描并自动归类；新导入的目录默认未信任，只分析文件、不执行它的构建或测试命令（项目页「执行信任」里可以打开）。配置了 GitHub 令牌还会自动建私有仓库上传。' });
 
   const finish = async (imported, skipped, category) => {
     await refreshShellData();

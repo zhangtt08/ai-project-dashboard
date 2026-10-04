@@ -24,6 +24,12 @@ before(async () => {
 after(() => { try { app.close(); } catch { /* already closed */ } });
 
 describe('full pipeline over three real fixture projects', () => {
+  // `trusted: true, trustedSource: 'test'` on the addProject calls below is a precondition, not
+  // a shortcut: this file tests what the pipeline COMPUTES from real build/test output, and the
+  // trust gate (src/core/trust.js) means a folder nobody trusted never produces that output.
+  // The fixture directories are written by this test itself, which is the same authority the
+  // demo projects get. Both directions of the gate are asserted in api.test.js and
+  // tests/integration/command-allowlist.test.js — never weakened here.
   const cases = [
     { kind: 'healthy', expectHealth: 'healthy', expectGate: 'PASS', suites: ['pass', 'pass'] },
     { kind: 'warning', expectHealth: 'warning', expectGate: 'FAIL', e2e: '22/25' },
@@ -34,7 +40,7 @@ describe('full pipeline over three real fixture projects', () => {
     test(`fixture-${c.kind} produces ${c.expectHealth} health and gate ${c.expectGate}`, { timeout: 240000 }, async () => {
       const dir = path.join(ROOT, c.kind);
       createFixtureProject(dir, c.kind);
-      const project = app.addProject({ workspacePath: dir, name: `Fixture ${c.kind}` });
+      const project = app.addProject({ workspacePath: dir, name: `Fixture ${c.kind}`, trusted: true, trustedSource: 'test' });
       const out = await app.orchestrator.fullScan(project.id, { runCommands: true, suites: ['unit', 'integration', 'e2e'] });
 
       assert.equal(out.metadata.ok, true);
@@ -106,7 +112,7 @@ describe('full pipeline over three real fixture projects', () => {
   test('a second scan after breaking the build detects a regression', { timeout: 240000 }, async () => {
     const dir = path.join(ROOT, 'regression');
     createFixtureProject(dir, 'healthy');
-    const project = app.addProject({ workspacePath: dir, name: 'Regression fixture' });
+    const project = app.addProject({ workspacePath: dir, name: 'Regression fixture', trusted: true, trustedSource: 'test' });
     const first = await app.orchestrator.fullScan(project.id, { runCommands: true, suites: ['unit', 'e2e'] });
     assert.equal(first.health.status, 'healthy');
 
@@ -127,7 +133,7 @@ describe('full pipeline over three real fixture projects', () => {
   test('repeated scans are idempotent: no duplicate tasks, risks or stages', { timeout: 240000 }, async () => {
     const dir = path.join(ROOT, 'idempotent');
     createFixtureProject(dir, 'healthy');
-    const project = app.addProject({ workspacePath: dir, name: 'Idempotency fixture' });
+    const project = app.addProject({ workspacePath: dir, name: 'Idempotency fixture', trusted: true, trustedSource: 'test' });
     await app.orchestrator.fullScan(project.id, { runCommands: false, suites: [] });
     await app.orchestrator.fullScan(project.id, { runCommands: false, suites: [] });
     await app.orchestrator.fullScan(project.id, { runCommands: false, suites: [] });

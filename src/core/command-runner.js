@@ -49,9 +49,140 @@ export const DANGEROUS_ARG_PATTERNS = [
   { rx: /[;&|]{1,2}/, reason: 'command chaining indicates an inline script' },
 ];
 
+/**
+ * git config keys whose VALUE git executes.
+ *
+ * One poisoned entry plus a later allowlisted read-only command is remote code execution:
+ * `git config core.fsmonitor "<cmd>"` is a write, `git status` is a read, and both are on the
+ * allowlist — two permitted invocations, no warning anywhere. So `git config` is not treated as
+ * a read command any more, and these keys are refused whichever direction they appear in.
+ * Patterns rather than exact names, because git's exec surface is namespaced
+ * (`pager.blame`, `diff.foo.driver`, `alias.lo`, `credential.<url>.helper`).
+ */
+export const GIT_EXEC_CONFIG_PATTERNS = [
+  { rx: /^core\.fsmonitor$/i, why: 'fsmonitor hook' },
+  { rx: /^core\.pager$/i, why: 'pager is run through a shell' },
+  { rx: /^core\.editor$/i, why: 'editor is run through a shell' },
+  { rx: /^core\.sshcommand$/i, why: 'ssh command is run for every network op' },
+  { rx: /^core\.hookspath$/i, why: 'redirects pre-commit / pre-push / post-* hooks' },
+  { rx: /^sequence\.editor$/i, why: 'sequencer editor is run through a shell' },
+  { rx: /^pager\./i, why: 'per-command pager is run through a shell' },
+  { rx: /^alias\./i, why: 'an alias beginning with ! is a shell command' },
+  { rx: /^grep\./i, why: 'grep.* plus --open-files-in-pager runs a pager' },
+  { rx: /^credential\./i, why: 'credential helper is an arbitrary command' },
+  { rx: /^(diff|merge)\..*\.(command|driver)$/i, why: 'external diff/merge driver is run by git' },
+  { rx: /^difftool\..*\.cmd$/i, why: 'difftool command' },
+  { rx: /^mergetool\..*\.cmd$/i, why: 'mergetool command' },
+  { rx: /^remote\..*\.proxy$/i, why: 'remote proxy command is executed' },
+  { rx: /^ext\./i, why: 'ext:: transport runs a command' },
+  { rx: /^fetch\.unpacklimit$/i, why: 'not a read; kept out of the allowlist' },
+];
+
+/** Flags that make `git config` write (or open an editor) instead of read. */
+const GIT_CONFIG_WRITE_FLAGS = [
+  '--add', '--unset', '--unset-all', '--replace-all', '--remove-section', '--rename-section',
+  '-f', '--file', '-e', '--edit', '--worktree',
+];
+
+/**
+ * The single place that decides what a `git config …` invocation may do.
+ *
+ * Reads of a safe key are allowed; anything that writes a value, opens an editor, names an
+ * exec-capable key, or dumps the whole config (which would echo other projects' secrets out of
+ * `~/.gitconfig` into a record) is refused with a reason that says why.
+ *
+ * @param {string[]} args the arguments after the binary name, e.g. ['config','core.fsmonitor','!x']
+ * @returns {{allowed:boolean, klass:string, reason:string, key:string|null, mode:string}}
+ */
+export function gitConfigVerdict(args = []) {
+  const tokens = args.slice(1);
+  const flags = [];
+  const positionals = [];
+  for (const t of tokens) {
+    if (t === '--') continue;
+    if (typeof t === 'string' && t.startsWith('-')) flags.push(t.split('=')[0]);
+    else positionals.push(String(t));
+  }
+
+  const execHit = (key) => GIT_EXEC_CONFIG_PATTERNS.find((p) => p.rx.test(String(key).toLowerCase()));
+  for (const key of positionals) {
+    const hit = execHit(key);
+    if (hit) {
+      return {
+        allowed: false, klass: COMMAND_CLASS.DANGEROUS, key, mode: 'read-or-write',
+        reason: `git config 涉及可执行配置项「${key}」（${hit.why}）。这类键的值会被 git 用 shell 跑起来，读和写都拒绝。`,
+      };
+    }
+  }
+
+  if (/^(--list|-l|--get-regexp|--get-color|--get-colorbool)$/i.test(flags[0] || '')) {
+    return {
+      allowed: false, klass: COMMAND_CLASS.POTENTIALLY_MUTATING, key: null, mode: 'dump',
+      reason: 'git config 不允许整份导出（--list/-l/--get-regexp）：那会把系统/全局配置里的地址与凭据带进分析记录。需要某个具体键时按键读。',
+    };
+  }
+
+  const writeFlag = flags.find((f) => GIT_CONFIG_WRITE_FLAGS.includes(f.toLowerCase()));
+  if (writeFlag) {
+    return {
+      allowed: false, klass: COMMAND_CLASS.DANGEROUS, key: positionals[0] || null, mode: 'write',
+      reason: `git config ${writeFlag} 是写入。Commander 对工作区只读（ADR-009），而写 git 配置正是 core.fsmonitor / core.hooksPath 那类代码执行链的第一步。`,
+    };
+  }
+
+  // `git config <key> [value…]` — two or more positionals is a write, whatever the caller meant.
+  if (positionals.length >= 2) {
+    return {
+      allowed: false, klass: COMMAND_CLASS.DANGEROUS, key: positionals[0], mode: 'write',
+      reason: `git config ${positionals[0]} <value> 是写入，一律拒绝。要读就只给键名（git config ${positionals[0]}）。`,
+    };
+  }
+
+  if (positionals.length === 1) {
+    const bare = positionals[0].toLowerCase();
+    if (GIT_CONFIG_READABLE_KEYS.some((k) => bare === k || bare.startsWith(`${k}.`) || bare === k)) {
+      return { allowed: true, klass: COMMAND_CLASS.READ_ONLY, key: positionals[0], mode: 'read', reason: '' };
+    }
+    return {
+      allowed: false, klass: COMMAND_CLASS.POTENTIALLY_MUTATING, key: positionals[0], mode: 'read',
+      reason: `git config 只允许读取白名单里的键（当前不含「${positionals[0]}」）。要新增可读音键请改 src/core/command-runner.js:GIT_CONFIG_READABLE_KEYS，并在评审里说明。`,
+    };
+  }
+
+  return { allowed: false, klass: COMMAND_CLASS.POTENTIALLY_MUTATING, key: null, mode: 'noop', reason: 'git config 需要给出要读取的键名。' };
+}
+
+/**
+ * Keys the analysis actually needs to read. An explicit list, because "any single-key read"
+ * would happily read `credential.https://x.helper` straight into a build record.
+ */
+export const GIT_CONFIG_READABLE_KEYS = [
+  'user.name', 'user.email', 'core.repositoryformatversion', 'core.bare', 'core.ignorecase',
+  'core.filemode', 'core.symlinks', 'core.logallrefupdates', 'commit.gpgsign', 'init.defaultbranch',
+];
+
+/**
+ * Package-manager script execution. `npm run <anything>` used to be stamped VALIDATION, which
+ * made any script in a stranger's package.json look as trustworthy as `npm test`. Only names
+ * that are shaped like validation get that class; everything else is reported honestly as
+ * potentially mutating (and is never auto-run: see src/core/trust.js).
+ */
+const VALIDATION_SCRIPT_RX = /^(build|test|tests|lint|lint:.*|type-?check|tsc|verify|check|coverage|unit.*|integration.*|e2e.*|smoke.*|audit|ci)([:_-].*)?$/i;
+
+export function packageScriptVerdict(bin, scriptName) {
+  const validation = VALIDATION_SCRIPT_RX.test(String(scriptName || ''));
+  return {
+    klass: validation ? COMMAND_CLASS.VALIDATION : COMMAND_CLASS.POTENTIALLY_MUTATING,
+    script: scriptName || null,
+    validation,
+  };
+}
+
 export const ALLOWLIST = [
   {
     bin: 'git',
+    // `config` stays in the pattern so the rule still matches, but gitConfigVerdict() below is
+    // what decides — an allowlisted prefix must never be mistaken for an allowlisted action.
     args: /^(status|diff|log|branch|rev-parse|show|ls-files|shortlog|describe|cat-file|symbolic-ref|config|stash\s+list|remote|tag|--version|-v)(\s|$)/i,
     klass: COMMAND_CLASS.READ_ONLY,
     label: 'git read-only inspection',
@@ -188,7 +319,8 @@ export function resolveInvocation(bin, args) {
 
 
 export function classifyCommand(command, args = []) {  const bin = path.basename(String(command)).toLowerCase().replace(/\.(exe|cmd|bat)$/, '');
-  const argLine = args.join(' ');
+  const argv = (args || []).map(String);
+  const argLine = argv.join(' ');
   for (const p of DANGEROUS_ARG_PATTERNS) {
     if (p.rx.test(`${bin} ${argLine}`)) {
       return { allowed: false, klass: COMMAND_CLASS.DANGEROUS, reason: p.reason };
@@ -197,8 +329,26 @@ export function classifyCommand(command, args = []) {  const bin = path.basename
   if (DANGEROUS_BINARIES.includes(bin)) {
     return { allowed: false, klass: COMMAND_CLASS.DANGEROUS, reason: `binary "${bin}" is on the deny list` };
   }
+
+  // git config is decided by one function, not by the allowlist prefix it happens to match.
+  if (bin === 'git' && argv[0] && argv[0].toLowerCase() === 'config') {
+    const verdict = gitConfigVerdict(argv);
+    if (!verdict.allowed) {
+      return { allowed: false, klass: verdict.klass, reason: verdict.reason, configKey: verdict.key, configMode: verdict.mode };
+    }
+    return { allowed: true, klass: verdict.klass, label: `git config read (${verdict.key})`, configKey: verdict.key, configMode: verdict.mode };
+  }
+
   const rule = ALLOWLIST.find((r) => r.bin === bin && r.args.test(argLine));
   if (!rule) return { allowed: false, klass: COMMAND_CLASS.POTENTIALLY_MUTATING, reason: `no allowlist rule matches "${bin} ${argLine}"`.trim() };
+
+  // `npm run <script>` / `pnpm run …` / `yarn run …`: honest class, never blanket VALIDATION.
+  if ((bin === 'npm' || bin === 'pnpm' || bin === 'yarn') && /^(run|run-script|test)$/i.test(argv[0] || '')) {
+    const script = bin === 'npm' && /^test$/i.test(argv[0]) ? 'test' : argv[1];
+    const verdict = packageScriptVerdict(bin, script);
+    return { allowed: true, klass: verdict.klass, label: rule.label, script: verdict.script, scriptValidation: verdict.validation };
+  }
+
   return { allowed: true, klass: rule.klass, label: rule.label };
 }
 
@@ -411,6 +561,17 @@ export function describeSecurityModel() {
     autoAllowed: AUTO_ALLOWED_SUMMARY,
     alwaysBlocked: DANGEROUS_BINARIES,
     argumentPatternsBlocked: DANGEROUS_ARG_PATTERNS.map((p) => ({ pattern: String(p.rx), reason: p.reason })),
+    gitConfig: {
+      writes: 'refused (any key/value, --add/--unset/--replace-all/--remove-section/--rename-section/-f/--edit/--worktree)',
+      dumps: 'refused (--list/-l/--get-regexp)',
+      executableKeysRefused: GIT_EXEC_CONFIG_PATTERNS.map((p) => String(p.rx)),
+      readableKeys: GIT_CONFIG_READABLE_KEYS,
+      decisionFunction: 'gitConfigVerdict()',
+    },
+    packageScripts: {
+      validationNames: String(VALIDATION_SCRIPT_RX),
+      otherScripts: 'potentially_mutating —— 不再是 validation，且未经信任的工作区不会自动跑',
+    },
     shellEnabled: false,
   };
 }

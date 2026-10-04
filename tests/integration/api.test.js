@@ -120,6 +120,30 @@ describe('project lifecycle over HTTP', () => {
     assert.ok(!stackFrame.test(res.text), 'a stack frame leaked to the client');
   });
 
+  test('a workspace added from outside starts untrusted, and trusting it is what enables commands', async () => {
+    // Precondition for the two scan tests below, not a convenience: since the trust gate,
+    // runCommands for a freshly imported folder is refused (see src/core/trust.js). Assert the
+    // refusal first, then make the decision — so this file proves both directions instead of
+    // quietly depending on an auto-trusted import.
+    const before = await request('GET', `/api/projects/${projectId}/trust`);
+    assert.equal(before.status, 200);
+    assert.equal(before.json.data.trusted, false);
+    assert.equal(before.json.data.wouldRunCommands, false);
+
+    const untrusted = await request('POST', `/api/projects/${projectId}/scan-sync`, { mode: 'full', runCommands: true });
+    assert.equal(untrusted.status, 200);
+    assert.equal(untrusted.json.data.commandsSkipped.code, 'workspace_untrusted');
+    assert.equal(untrusted.json.data.build, null, 'an untrusted folder must not have executed its build');
+
+    const noConfirm = await request('POST', `/api/projects/${projectId}/trust`, { trusted: true });
+    assert.equal(noConfirm.status, 400, 'granting trust without an explicit confirm must be refused');
+
+    const granted = await request('POST', `/api/projects/${projectId}/trust`, { trusted: true, confirm: true });
+    assert.equal(granted.status, 200);
+    assert.equal(granted.json.data.trust.trusted, true);
+    assert.equal(granted.json.data.trust.source, 'user');
+  });
+
   test('the quick scan endpoint returns real git + file counts', async () => {
     const res = await request('POST', `/api/projects/${projectId}/scan-sync`, { mode: 'quick' });
     assert.equal(res.status, 200);
@@ -316,6 +340,9 @@ describe('manual command override', () => {
     const add = await request('POST', '/api/projects', { workspacePath: cmdDir, name: 'cmd fixture' });
     assert.equal(add.status, 200);
     id = add.json.data.id;
+    // Running a pinned command is execution, so it needs the same recorded decision a scan does.
+    const trust = await request('POST', `/api/projects/${id}/trust`, { trusted: true, confirm: true });
+    assert.equal(trust.status, 200);
     const set = await request('POST', `/api/projects/${id}/commands`, { commands: { build: 'npm run build' } });
     assert.equal(set.status, 200);
     assert.equal(set.json.data.manualCommands.build, 'npm run build');

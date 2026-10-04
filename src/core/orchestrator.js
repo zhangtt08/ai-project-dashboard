@@ -5,9 +5,10 @@
  * step 15 (AI enrichment) is optional, opt-in and always schema-validated.
  */
 import {
-  JOB_TYPE, EVENT_TYPE, PROJECT_STATUS, PROJECT_HEALTH, TASK_STATUS, GATE_RESULT,
+  JOB_TYPE, EVENT_TYPE, PROJECT_STATUS, PROJECT_HEALTH, TASK_STATUS, GATE_RESULT, RUN_STATUS,
 } from '../domain/constants.js';
 import { newId, nowIso, truncate } from './util.js';
+import { commandsAllowedFor, TRUST_REASON_CODE } from './trust.js';
 import { WorkspaceError } from '../domain/errors.js';
 import { logger } from './logger.js';
 import { evSnapshot, evFile } from './evidence.js';
@@ -148,6 +149,12 @@ export class Orchestrator {
    */
   async fullScan(projectId, { runCommands = true, suites = ['unit', 'integration', 'e2e'] } = {}, ctx = {}) {
     const project = this.#project(projectId);
+    // The trust gate lives here as well as in the routes, so a caller that forgets it cannot
+    // execute a stranger's scripts: one decision function, checked where the subprocess starts.
+    const commandGate = commandsAllowedFor(project, runCommands);
+    if (!commandGate.allowed && runCommands) {
+      log.info('commands_skipped', { projectId, reason: commandGate.reason, trusted: commandGate.trusted });
+    }
     const started = Date.now();
     const prog = makeProgress(ctx, FULL_SCAN_STEPS);
     this.events.record(projectId, EVENT_TYPE.SCAN_STARTED, 'Full scan started', { kind: 'full' });
@@ -240,7 +247,7 @@ export class Orchestrator {
     let build = null;
     let lint = null;
     let typecheck = null;
-    if (runCommands) {
+    if (commandGate.allowed) {
       prog.step('构建'); prog.guard();
       build = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, 'build', { signal: ctx.signal || null });
       if (build.cancelled) throw new CancelledError('构建');
@@ -266,7 +273,7 @@ export class Orchestrator {
 
     // 7. Tests
     const tests = {};
-    if (runCommands) {
+    if (commandGate.allowed) {
       prog.step('测试'); prog.guard();
       for (const suite of suites) {
         const run = await this.testAnalyzer.runSuite({ root: project.workspace_path, metadata }, suite, { signal: ctx.signal || null });
@@ -390,6 +397,13 @@ export class Orchestrator {
       taskSync,
       nextAction: null,
       lastScanDurationMs: Date.now() - started,
+      // Which is on, and why: a card that says "没有构建结果" must be able to say whether that
+      // is because the project has no build, or because Commander was never told to run it.
+      commandsSkipped: commandGate.allowed ? null : {
+        code: commandGate.trusted ? 'not_requested' : TRUST_REASON_CODE,
+        reason: commandGate.reason,
+        trusted: commandGate.trusted,
+      },
       lastScanAt: nowIso(),
       lastSnapshotId: snapshot.id,
       lastSnapshotSeq: seq,
@@ -499,6 +513,9 @@ export class Orchestrator {
       nextAction,
       memory: memoryResult.memory,
       memoryCreated: memoryResult.created,
+      // Whether this scan ran commands at all — the API and the tests read the reason from here
+      // rather than inferring it from a missing build number.
+      commandsSkipped: mergedMeta.commandsSkipped,
       failedCases,
       durationMs: Date.now() - started,
     };
@@ -640,6 +657,16 @@ export class Orchestrator {
     });
     queue.register(JOB_TYPE.BUILD, async (payload, ctx = {}) => {
       const project = this.#project(payload.projectId);
+      const gate = commandsAllowedFor(project, true);
+      if (!gate.allowed) {
+        const reason = gate.reason;
+        this.repo.insert('build_results', {
+          id: newId('bld'), project_id: payload.projectId, kind: payload.kind || 'build', command: '(未执行)',
+          status: RUN_STATUS.UNSUPPORTED, exit_code: null, duration_ms: 0, stdout_summary: '',
+          stderr_summary: reason, truncated: 0, unsupported_reason: reason, ts: nowIso(),
+        });
+        return { status: RUN_STATUS.UNSUPPORTED, skipped: TRUST_REASON_CODE, reason };
+      }
       const metadata = (project.metadata && project.metadata.metadata) || (await this.scanner.scan(project.workspace_path, {}));
       metadata.manualCommands = projectManualCommands(project);
       const result = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, payload.kind || 'build', { signal: ctx.signal || null });
@@ -657,6 +684,16 @@ export class Orchestrator {
     });
     queue.register(JOB_TYPE.TEST, async (payload, ctx = {}) => {
       const project = this.#project(payload.projectId);
+      const gate = commandsAllowedFor(project, true);
+      if (!gate.allowed) {
+        const run = {
+          suite: payload.suite || 'unit', framework: 'unknown', command: '(未执行)',
+          status: 'unsupported', total: 0, passed: 0, failed: 0, skipped: 0, durationMs: 0,
+          exitCode: null, parseConfidence: 'unknown', rawTail: gate.reason, cases: [], ts: nowIso(),
+        };
+        this.#persistTestRun(payload.projectId, run);
+        return { status: RUN_STATUS.UNSUPPORTED, skipped: TRUST_REASON_CODE, reason: gate.reason, suite: run.suite };
+      }
       const metadata = (project.metadata && project.metadata.metadata) || (await this.scanner.scan(project.workspace_path, {}));
       metadata.manualCommands = projectManualCommands(project);
       const run = await this.testAnalyzer.runSuite({ root: project.workspace_path, metadata }, payload.suite || 'unit', { signal: ctx.signal || null });

@@ -252,6 +252,63 @@ function openCommandEditor(projectId, kind, current) {
   input.focus();
 }
 
+const TRUST_SOURCE_ZH = {
+  migration: '这个项目在本次改造之前就在你的清单里，所以保持了原来的行为：扫描会执行它检测到的构建与测试命令。要收紧就点下面的「取消信任」。',
+  demo: '这是 Commander 自己生成的演示项目（在数据目录里），不是别人写的代码。',
+  user: '这是你在本项目页面上做的决定，记录时间见下方。',
+  import: '这个目录是后来添加进来的（拖拽、导入或首屏自动导入），在有人点头之前 Commander 只读它的文件。',
+  unknown: '来源没有记录（旧数据），按未信任处理。',
+};
+
+/**
+ * 执行信任 —— the one decision that lets a scan run this folder's scripts.
+ *
+ * The panel states what the current state means, where it came from, and how to change it, in
+ * Chinese, because "为什么没有构建结果" is the question this answers. Granting trust confirms
+ * first and never runs anything by itself: execution starts at the next scan.
+ */
+function trustCard(d) {
+  const p = d.project;
+  const t = p.trust || {};
+  const sourceLine = t.trusted
+    ? (TRUST_SOURCE_ZH[t.source] || TRUST_SOURCE_ZH.unknown) + (t.decidedAt ? `（决定时间 ${t.decidedAt}）` : '')
+    : TRUST_SOURCE_ZH.import;
+  return card('执行信任', h('div', { class: 'stack-sm' }, [
+    h('div', { class: 'row wrap' }, [
+      h('span', { class: `badge ${t.trusted ? 'badge-ok' : 'badge-unsupported'}`, text: t.labelZh || (t.trusted ? '已信任' : '未信任') }),
+      h('span', { class: 'chip', text: t.trusted ? `扫描会执行命令：${(d.commands || []).filter((c) => c.supported).map((c) => c.display).slice(0, 3).join('、') || '未检测到命令'}` : '扫描不会执行任何命令' }),
+    ]),
+    h('div', { class: 'small', text: t.meaningZh || '' }),
+    h('div', { class: 'small muted', text: sourceLine }),
+    h('div', { class: 'small muted', text: t.howToEnableZh || '' }),
+    h('div', { class: 'row wrap' }, [
+      t.trusted
+        ? h('button', { class: 'btn btn-sm', text: '取消信任（此后扫描只读文件）', onClick: () => askTrust(p.id, false) })
+        : h('button', { class: 'btn btn-primary btn-sm', text: '信任并允许执行命令', onClick: () => askTrust(p.id, true) }),
+    ]),
+  ]), { hint: '判据在 src/core/trust.js；这一步只改记录，不会立刻跑任何东西' });
+}
+
+function askTrust(projectId, grant) {
+  if (!grant) { applyTrust(projectId, false); return; }
+  const dlg = modal('信任这个项目目录？', h('div', { class: 'stack-sm' }, [
+    h('div', { text: '打开的是：以后每次扫描都会在这个目录里运行 Commander 检测到的构建、Lint、类型检查与测试命令。' }),
+    h('div', { class: 'small muted', text: '这些命令来自目录里自己的 package.json 或框架配置。只有你了解并认可这个来源时才该点信任 —— 别人写的脚本在被执行时想做什么就做什么，Commander 拦不住内容，只拦得住危险命令模式（安装、发布、删除、shell 串联）。' }),
+    h('div', { class: 'row' }, [
+      h('button', { class: 'btn btn-primary', text: '我确认，信任它', onClick: async () => { dlg.close(); await applyTrust(projectId, true); } }),
+      h('button', { class: 'btn', text: '先不', onClick: () => dlg.close() }),
+    ]),
+  ]));
+}
+
+async function applyTrust(projectId, trusted) {
+  try {
+    await api.setTrust(projectId, trusted, trusted === true);
+    toast(trusted ? '已信任：下一次扫描会执行检测到的命令' : '已取消信任：扫描只读文件，不再执行任何命令', 'ok', 6000);
+    Router.reload();
+  } catch (err) { toast(errorText(err), 'error'); }
+}
+
 function renderCommandsCard(d) {
   if (!d.commands.length) {
     return card('构建 / 测试命令', stateEmpty('还没有元数据', '运行一次全量扫描以检测构建与测试命令。'));
@@ -291,6 +348,8 @@ async function renderOverview(container, id) {
       ]),
 
       githubCard(d),
+
+      trustCard(d),
 
       h('div', { class: 'grid grid-2' }, [
         card('进度', h('div', { class: 'stack-sm' }, [

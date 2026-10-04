@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { openDatabase } from '../../src/db/database.js';
+import { openDatabase, Database } from '../../src/db/database.js';
+import { MIGRATIONS, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, FTS_MIGRATION } from '../../src/db/migrations.js';
 import { Repository } from '../../src/db/repositories.js';
 import { StructuredRunner, extractJson } from '../../src/core/ai/structured.js';
 import { ProviderRegistry, AIProvider, maskSecrets, excerpt } from '../../src/core/ai/provider.js';
@@ -157,9 +158,36 @@ describe('Database + Repository', () => {
     assert.deepEqual(first.applied, []);
     const versions = db.all('SELECT version FROM schema_migrations ORDER BY version').map((r) => Number(r.version));
     // v5 (`job_progress`) is part of the registry: the queue persists which step a running scan is
-    // on, and that has to survive a page reload. Keep this list in step with `allMigrations()`.
-    assert.deepEqual(versions, [1, 2, 3, 4, 5]);
+    // on, and that has to survive a page reload. v6 (`project_command_trust`) is the column that
+    // records whether a scan may execute this folder's scripts — including the documented
+    // backfill that keeps rows which already existed trusted. Keep this list in step with
+    // `allMigrations()`.
+    assert.deepEqual(versions, [1, 2, 3, 4, 5, 6]);
     assert.equal(db.ftsAvailable, true);
+  });
+
+  test('v6 really converts the rows that already existed, and a fresh row is not trusted', () => {
+    // Replay of the upgrade path, not a reading of the SQL text: build the pre-v6 schema, insert
+    // a row the way the running app would, then apply MIGRATION_6 over it. This is the whole
+    // answer to "where does the existing trust come from" — the migration, recorded per row as
+    // trusted_source='migration' — and the other half is the shipped default of 0.
+    const db = new Database({ file: ':memory:' });
+    for (const m of [MIGRATIONS[0], FTS_MIGRATION, MIGRATION_3, MIGRATION_4, MIGRATION_5]) {
+      for (const stmt of m.up) db.exec(stmt);
+    }
+    const repo = new Repository(db);
+    const before = repo.insert('projects', { name: 'Old', workspace_path: '/old' });
+    assert.equal(repo.hasColumn('projects', 'trusted'), false, 'the pre-v6 schema must not have the column yet');
+
+    for (const stmt of MIGRATION_6.up) db.exec(stmt);
+    const after = repo.get('projects', before.id);
+    assert.equal(after.trusted, true, 'MIGRATION_6 is what marks the rows that already existed');
+    assert.equal(after.trusted_source, 'migration');
+
+    const fresh = repo.insert('projects', { name: 'New', workspace_path: '/new' });
+    assert.equal(fresh.trusted, false, 'a row created after the upgrade has no trust until someone decides');
+    assert.equal(fresh.trusted_source, null);
+    db.close();
   });
 
   test('JSON and boolean columns round-trip', () => {

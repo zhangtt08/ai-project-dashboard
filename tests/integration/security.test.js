@@ -31,7 +31,11 @@ before(async () => {
   app = new App({ dataDir: path.join(root, 'data'), logLevel: 'error' });
   dir = path.join(root, 'target-workspace');
   createFixtureProject(dir, 'healthy');
-  const project = app.addProject({ workspacePath: dir, name: 'Security target' });
+  // trusted: this fixture's own build/test output is part of what is searched for leaks below
+  // ("a secret must not reach the database even through command stdout"), so the scan has to be
+  // allowed to run it. The fixture directory is written by this test — see src/core/trust.js for
+  // where trust may come from; the refusal path is covered in command-allowlist.test.js.
+  const project = app.addProject({ workspacePath: dir, name: 'Security target', trusted: true, trustedSource: 'test' });
   projectId = project.id;
 
   mtimesBefore = snapshotMtimes(dir);

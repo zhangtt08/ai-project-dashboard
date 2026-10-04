@@ -49,6 +49,9 @@ export const api = {
   deletionAssessment: (id) => request('GET', `/api/projects/${id}/deletion`),
   deleteProjectWithSource: (id, confirmToken) => request('DELETE', `/api/projects/${id}?purge=true&confirm_token=${encodeURIComponent(confirmToken)}`),
   suggestions: (id) => request('GET', `/api/projects/${id}/suggestions`),
+  /** 执行信任：扫描能不能运行这个目录里的命令。判据只在 src/core/trust.js。 */
+  trust: (id) => request('GET', `/api/projects/${id}/trust`),
+  setTrust: (id, trusted, confirm = false) => request('POST', `/api/projects/${id}/trust`, { trusted, confirm }),
   setCommands: (id, commands) => request('POST', `/api/projects/${id}/commands`, { commands }),
   runCommand: (id, kind) => request('POST', `/api/projects/${id}/commands/run`, { kind }),
   publishGithub: (id) => request('POST', `/api/projects/${id}/github/publish`),

@@ -437,6 +437,29 @@ export const MIGRATION_5 = {
   ],
 };
 
+/**
+ * v6: 命令执行的信任闸门。
+ *
+ * A full scan runs the build/test commands it *detects*, which for a folder someone else
+ * maintained means running their package.json. The column makes that a recorded decision
+ * instead of a default: new imports land at 0 (analysis only), and the rows that already
+ * existed when this shipped are marked trusted with `trusted_source='migration'` — they were
+ * chosen by this person on this machine, and silently switching every tracked project (and
+ * Commander's own self-scan) to "no build, no tests" would be a change nobody agreed to.
+ * That backfill is the whole origin of the existing trust; see src/core/trust.js.
+ */
+export const MIGRATION_6 = {
+  version: 6,
+  name: 'project_command_trust',
+  up: [
+    `ALTER TABLE projects ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0;`,
+    `ALTER TABLE projects ADD COLUMN trusted_at TEXT;`,
+    `ALTER TABLE projects ADD COLUMN trusted_source TEXT;`,
+    `UPDATE projects SET trusted = 1, trusted_source = 'migration' WHERE trusted = 0;`,
+    `CREATE INDEX IF NOT EXISTS idx_projects_trusted ON projects(trusted);`,
+  ],
+};
+
 /** FTS5 is optional — probed at runtime, with LIKE fallback (KNOWN_ISSUES TODO-P2-005). */
 export const FTS_MIGRATION = {
   version: 2,
@@ -450,6 +473,6 @@ export const FTS_MIGRATION = {
 };
 
 export function allMigrations({ ftsAvailable }) {
-  const core = [...MIGRATIONS, MIGRATION_3, MIGRATION_4, MIGRATION_5];
-  return ftsAvailable ? [...MIGRATIONS, FTS_MIGRATION, MIGRATION_3, MIGRATION_4, MIGRATION_5] : core;
+  const core = [...MIGRATIONS, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6];
+  return ftsAvailable ? [...MIGRATIONS, FTS_MIGRATION, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6] : core;
 }
