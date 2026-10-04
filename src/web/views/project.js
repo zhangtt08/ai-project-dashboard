@@ -142,10 +142,19 @@ function scheduleScanRefresh(projectId) {
 }
 
 async function runScan(mode) {
+  // 全量扫描会真的跑构建与测试命令 —— 那是会占用这台机器几分钟的动作，点错一次就该先问一句。
+  if (mode === 'full' && !window.confirm('全量扫描会在这个目录里真的执行构建、Lint、类型检查与测试命令，可能需要几分钟。现在就开始吗？')) {
+    return;
+  }
   try {
-    toast(`已入队${mode === 'quick' ? '快速' : '全量'}扫描…`, 'info', 4000);
-    await api.scan(current.id, { mode, runCommands: mode === 'full', suites: ['unit', 'e2e'] });
-    toast('扫描已入队——任务完成后结果自动出现。', 'ok');
+    const out = await api.scan(current.id, { mode, runCommands: mode === 'full', suites: ['unit', 'e2e'] });
+    if (out.deduped) {
+      // The click did not start a second build in the same directory; say what actually happened.
+      toast(`已经有${mode === 'quick' ? '快速' : '全量'}扫描在${out.status === 'running' ? '运行中' : '排队中'}——不会重复开始第二次。`, 'info', 5000);
+      state.scanPending.add(current.id);
+      return;
+    }
+    toast(`已入队${mode === 'quick' ? '快速' : '全量'}扫描——任务完成后结果自动出现。`, 'ok', 5000);
     const started = Date.now();
     const poll = setInterval(async () => {
       if (Date.now() - started > 180000) { clearInterval(poll); return; }
@@ -399,8 +408,8 @@ async function renderStages(container, id) {
       { label: '#', render: (r) => String(r.order_index + 1), num: true },
       { label: '名称', key: 'name' },
       { label: '状态', render: (r) => h('span', { class: `badge ${r.status === 'completed' ? 'badge-pass' : r.status === 'in_progress' ? 'badge-info' : r.status === 'blocked' ? 'badge-critical' : 'badge-unknown'}`, text: enumLabel(r.status) }) },
-      { label: '来源', key: 'source' },
-      { label: '置信度', key: 'confidence' },
+      // 一条阶段记录说得出它是从哪来的就够了：来源是事实，"置信度 高" 是 nobody can check 的分数。
+      { label: '记录来源', render: (r) => h('span', { class: 'small', title: `confidence=${r.confidence}`, text: `${enumLabel(r.source) || r.source}${r.confidence === 'unknown' ? '（依据不足）' : ''}` }) },
       { label: '开始时间', render: (r) => fmt.date(r.started_at) },
       { label: '完成时间', render: (r) => fmt.date(r.completed_at) },
     ], stages) : stateEmpty('无法推断出阶段', '请在 SPEC.md 或 README.md 中声明阶段，例如 “## Stage 1 — Foundations”。无法判断时 Commander 报为未知，而不是编造阶段。'), { hint: '由规范/README 标题与任务分布推断' }),
@@ -425,7 +434,7 @@ async function renderTasks(container, id) {
       if (!title) return;
       try {
         await api.addTask(id, { title, priority: addPriority.value });
-        toast('Task added', 'ok');
+        toast('任务已添加', 'ok');
         renderTasks(container, id);
       } catch (err) { toast(err.message, 'error'); }
     };
@@ -453,8 +462,7 @@ async function renderTasks(container, id) {
         }, ['todo', 'in_progress', 'blocked', 'done', 'cancelled'].map((s) => h('option', { value: s, selected: s === r.status, text: enumLabel(s) }))) },
         { label: '优先级', render: (r) => h('span', { class: 'badge badge-neutral', text: r.priority }) },
         { label: '标题', render: (r) => h('div', {}, [h('div', { class: 'small', text: r.title }), r.description ? h('div', { class: 'small muted', text: fmt.truncate(r.description, 140) }) : null]) },
-        { label: '来源', key: 'source' },
-        { label: '置信度', key: 'confidence' },
+        { label: '记录来源', render: (r) => h('span', { class: 'small', title: `confidence=${r.confidence}`, text: `${enumLabel(r.source) || r.source}${r.confidence === 'unknown' ? '（依据不足）' : ''}` }) },
         { label: '证据', render: (r) => evidenceList(r.evidence) },
         { label: '更新时间', render: (r) => fmt.rel(r.updated_at) },
       ], tasks) : stateEmpty('任务账本为空', '全量扫描后，任务会由规范、Markdown 复选框与 TODO/FIXME 标记自动生成。')),
@@ -468,10 +476,10 @@ async function renderTests(container, id) {
   await mountAsync(container, () => api.tests(id), ({ history, latest }) => h('div', { class: 'stack' }, [
     h('div', { class: 'grid grid-3' }, ['unit', 'integration', 'e2e'].map((suite) => {
       const run = latest[suite];
-      return metric(`${suite} tests`, run ? (run.total ? `${run.passed}/${run.total}` : run.status) : 'not run', {
+      return metric(`${SUITE_ZH[suite] || suite}`, run ? (run.total ? `${run.passed}/${run.total}` : runStatusLabel(run.status)) : '没有运行记录', {
         cls: run && run.status === 'pass' ? 'ok' : run && (run.status === 'fail' || run.status === 'error') ? 'alert' : '',
         sm: true,
-        foot: run ? `${run.framework} · ${fmt.duration(run.duration_ms)} · ${fmt.rel(run.ts)}` : 'no run recorded',
+        foot: run ? `${run.framework} · ${fmt.duration(run.duration_ms)} · ${fmt.rel(run.ts)}` : '没有记录',
       });
     })),
     ...['unit', 'integration', 'e2e'].map((suite) => {
@@ -480,11 +488,13 @@ async function renderTests(container, id) {
       return card(`${SUITE_ZH[suite] || suite} — 最近一次运行`, run ? h('div', { class: 'stack' }, [
         h('div', { class: 'row wrap' }, [
           statusBadge(run.status),
-          h('code', { class: 'inline', text: run.command || '(no command)' }),
-          h('span', { class: 'chip', text: `framework: ${run.framework}` }),
-          h('span', { class: 'chip', text: `解析置信度 ${run.parse_confidence}` }),
-          h('span', { class: 'chip', text: `exit: ${run.exit_code}` }),
-          h('span', { class: 'chip', text: `duration: ${fmt.duration(run.duration_ms)}` }),
+          h('code', { class: 'inline', text: run.command || '(没有命令)' }),
+          h('span', { class: 'chip', text: `框架：${run.framework}` }),
+          // 解析置信度讲的是"这条输出被读得多确定"，不是项目好坏的分数；保留是因为它决定
+          // 上面的数字能不能信，但它的措辞必须让人知道自己在读什么。
+          h('span', { class: 'chip', title: `输出由 ${run.parser || 'reporter'} 解析`, text: `输出解析：${enumLabel(run.parse_confidence) || run.parse_confidence}` }),
+          h('span', { class: 'chip', text: `退出码：${run.exit_code}` }),
+          h('span', { class: 'chip', text: `耗时：${fmt.duration(run.duration_ms)}` }),
         ]),
         run.raw_tail ? h('details', {}, [h('summary', { class: 'small muted', text: '原始输出（末尾片段）' }), h('pre', { class: 'code', text: run.raw_tail })]) : null,
         (run.cases || []).length ? h('div', { class: 'stack-sm' }, [
@@ -504,7 +514,7 @@ async function renderTests(container, id) {
           { label: '总数', render: (r) => String(r.total), num: true },
           { label: '耗时', render: (r) => fmt.duration(r.durationMs), num: true },
         ], hist) : null,
-      ]) : stateEmpty(`${suite} tests have not been run`, '请运行一次全量扫描；该项目也可能确实没有这套测试（会报为不适用，而不是失败）。'));
+      ]) : stateEmpty(`${SUITE_ZH[suite] || suite}还没有运行过`, '请运行一次全量扫描；该项目也可能确实没有这套测试（会报为不适用，而不是失败）。'));
     }),
   ]), { loadingLabel: '正在加载测试历史…' });
 }

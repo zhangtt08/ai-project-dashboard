@@ -20,10 +20,13 @@ export class StageManager {
     for (const spec of specs) {
       const parsed = spec.parsed || {};
       for (const s of parsed.stages || []) {
-        const key = `${s.index}:${s.name.toLowerCase()}`;
+        // A stage without a name is still a stage — it is numbered, so say so. Resolving the name
+        // BEFORE the dedupe key is what keeps one odd document from throwing a full scan down.
+        const name = s.name || `Stage ${s.index}`;
+        const key = `${s.index}:${name.toLowerCase()}`;
         if (found.has(key)) continue;
         found.set(key, {
-          name: s.name || `Stage ${s.index}`,
+          name,
           index: s.index,
           description: `Declared in ${spec.path}`,
           evidence: [evFile(spec.path, `line ${s.line}`)],

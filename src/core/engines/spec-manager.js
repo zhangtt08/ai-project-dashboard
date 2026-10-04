@@ -93,8 +93,16 @@ export function parseMarkdown(text, { path: relPath = '' } = {}) {
       const item = { text: cb[2].trim(), checked: cb[1].toLowerCase() === 'x', line: i + 1, path: relPath, stage: currentStage ? currentStage.name : null };
       result.checkboxes.push(item);
       const bucket = current || 'acceptance';
-      if (Array.isArray(result[bucket])) result[bucket].push(item);
-      else if (bucket in result) result[bucket].push(item);
+      // `stages` is a structured list of stage DECLARATIONS ({name,index,line}); a checkbox is
+      // not one. Pushing it there used to append a row with no `name`, and the first full scan of
+      // any README shaped like "## Stage 1 — Setup" + "- [x] scaffold" then died with
+      // `Cannot read properties of undefined (reading 'toLowerCase')`. The checkbox still lands in
+      // sections.stages.items, so nothing about the document is lost — it just stops being
+      // mistaken for a stage.
+      if (bucket !== 'stages') {
+        if (Array.isArray(result[bucket])) result[bucket].push(item);
+        else if (bucket in result) result[bucket].push(item);
+      }
       if (result.sections[bucket]) result.sections[bucket].items.push(item);
       return;
     }

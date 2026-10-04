@@ -49,6 +49,19 @@ before(async () => {
 after(() => { try { app.close(); server.close(); } catch { /* noop */ } });
 
 describe('meta and health endpoints', () => {
+  test('HTTP boundary rejects cross-site writes and oversized bodies with a usable response', async () => {
+    const crossSite = await fetch(`${baseUrl}/api/diagnostics/parse-test`, {
+      method: 'POST', headers: { origin: 'https://untrusted.example', 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(crossSite.status, 403);
+    const large = await fetch(`${baseUrl}/api/diagnostics/parse-test`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ stdout: 'x'.repeat(2 * 1024 * 1024) }),
+    });
+    assert.equal(large.status, 413);
+    assert.equal(large.headers.get('connection'), 'close');
+    assert.equal((await request('GET', '/api/health')).status, 200);
+  });
+
   test('GET /api/health reports version', async () => {
     const res = await request('GET', '/api/health');
     assert.equal(res.status, 200);

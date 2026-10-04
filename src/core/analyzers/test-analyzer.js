@@ -20,8 +20,9 @@ export class TestAnalyzer {
   /**
    * @param {{root:string, metadata:object}} project
    * @param {'unit'|'integration'|'e2e'} suite
+   * @param {{signal?:AbortSignal}} [options] kills the test process when the job is cancelled
    */
-  async runSuite(project, suite = 'unit') {
+  async runSuite(project, suite = 'unit', { signal = null } = {}) {
     const kind = suite === 'e2e' ? 'e2e' : suite === 'integration' ? 'integrationTest' : 'test';
     const detected = detectCommand(project.metadata, kind);
     const ts = nowIso();
@@ -49,6 +50,7 @@ export class TestAnalyzer {
       cwd: project.root,
       timeoutMs: this.testTimeoutMs,
       purpose: `${suite} test suite`,
+      signal,
     });
 
     const parsed = parseTestOutput(res.stdout, res.stderr, { exitCode: res.exitCode, suite });

@@ -22,6 +22,7 @@ export class AnalysisQueue {
     this.handlers = new Map();
     this.running = new Map();
     this.cancelled = new Set();
+    this.controllers = new Map();
     this.timer = null;
     this.stopped = true;
   }
@@ -32,7 +33,22 @@ export class AnalysisQueue {
     return this;
   }
 
-  enqueue({ projectId, type, payload = {}, priority = 5, timeoutMs = 600000, maxAttempts = 2 }) {
+  /**
+   * Enqueue a job.
+   *
+   * `dedupe` makes the enqueue idempotent for a (project, type) pair: a second click while the
+   * first scan is still queued or running returns that job instead of starting a second build
+   * in the same directory. Two full scans of one workspace racing each other produce results
+   * neither of them can explain, so the queue refuses the duplicate and the caller is told so.
+   */
+  enqueue({ projectId, type, payload = {}, priority = 5, timeoutMs = 600000, maxAttempts = 2, dedupe = false }) {
+    if (dedupe && projectId) {
+      const active = this.findActive(projectId, type);
+      if (active) {
+        qlog.info('deduped', { type, projectId, id: active.id, status: active.status });
+        return Object.assign(active, { reused: true });
+      }
+    }
     const job = this.repo.insert('analysis_jobs', {
       id: newId('job'),
       project_id: projectId || null,
@@ -42,6 +58,7 @@ export class AnalysisQueue {
       attempts: 0,
       max_attempts: maxAttempts,
       timeout_ms: timeoutMs,
+      progress: {},
       payload,
       result: {},
       error: '',
@@ -49,6 +66,12 @@ export class AnalysisQueue {
     qlog.info('enqueued', { type, projectId, id: job.id });
     if (!this.stopped) this.#tick();
     return job;
+  }
+
+  /** A queued-or-running job of this type for this project, or null. Read from stored state. */
+  findActive(projectId, type) {
+    const rows = this.repo.list('analysis_jobs', { project_id: projectId, type }, { orderBy: 'created_at DESC', limit: 20 });
+    return rows.find((j) => j.status === JOB_STATUS.QUEUED || j.status === JOB_STATUS.RUNNING) || null;
   }
 
   start(intervalMs = 300) {
@@ -66,13 +89,35 @@ export class AnalysisQueue {
     this.timer = null;
   }
 
+  /**
+   * Cancel a job. The abort controller is what makes this a real cancel: the running handler
+   * sees `signal.aborted`, CommandRunner kills its child process, and the row stays CANCELLED
+   * even after the promise finally settles. Marking the database row alone would leave the
+   * project's build or test running behind a card that says 已取消.
+   */
   cancel(jobId) {
     this.cancelled.add(jobId);
+    const controller = this.controllers.get(jobId);
+    if (controller) { try { controller.abort(); } catch { /* already aborted */ } }
     const job = this.repo.get('analysis_jobs', jobId);
     if (job && (job.status === JOB_STATUS.QUEUED || job.status === JOB_STATUS.RUNNING)) {
       this.repo.update('analysis_jobs', jobId, { status: JOB_STATUS.CANCELLED, finished_at: nowIso(), error: 'cancelled by user' });
+      return true;
     }
-    return true;
+    // A job that already reached a terminal state cannot be cancelled; saying so truthfully
+    // is more useful than pretending the click worked.
+    return false;
+  }
+
+  /**
+   * Progress the queue can actually substantiate: which numbered step of a known step list the
+   * job is on. No percentage is invented for a step whose duration nobody measured — the UI
+   * pairs this with the project's own previous scan time, which is a real recorded number.
+   */
+  reportProgress(jobId, progress) {
+    const row = this.repo.get('analysis_jobs', jobId);
+    if (!row || row.status !== JOB_STATUS.RUNNING) return null;
+    return this.repo.update('analysis_jobs', jobId, { progress: { ...progress, at: nowIso() } });
   }
 
   list({ status = null, limit = 50 } = {}) {
@@ -93,6 +138,7 @@ export class AnalysisQueue {
     for (const job of queued) {
       if (this.running.size >= this.concurrency) break;
       if (this.running.has(job.id)) continue;
+      if (this.cancelled.has(job.id)) continue;
       this.#run(job);
     }
   }
@@ -103,13 +149,15 @@ export class AnalysisQueue {
       this.repo.update('analysis_jobs', job.id, { status: JOB_STATUS.FAILED, error: `no handler registered for ${job.type}`, finished_at: nowIso() });
       return;
     }
+    const controller = new AbortController();
     this.running.set(job.id, true);
+    this.controllers.set(job.id, controller);
     this.repo.update('analysis_jobs', job.id, { status: JOB_STATUS.RUNNING, started_at: nowIso(), attempts: job.attempts + 1 });
     const started = Date.now();
     const timeout = sleepCancellable(job.timeout_ms || 600000);
     try {
       const result = await Promise.race([
-        handler(job.payload || {}, job),
+        handler(job.payload || {}, { jobId: job.id, signal: controller.signal, report: (p) => this.reportProgress(job.id, p) }),
         timeout.promise.then(() => { throw new Error(`job timed out after ${job.timeout_ms}ms`); }),
       ]);
       if (this.cancelled.has(job.id)) throw new Error('cancelled by user');
@@ -118,17 +166,26 @@ export class AnalysisQueue {
       });
       qlog.info('completed', { id: job.id, type: job.type, durationMs: Date.now() - started });
     } catch (err) {
-      const attempts = (this.repo.get('analysis_jobs', job.id) || {}).attempts || 1;
-      const retryable = attempts < (job.max_attempts || 2) && !/cancelled/.test(err.message);
-      this.repo.update('analysis_jobs', job.id, {
-        status: retryable ? JOB_STATUS.QUEUED : JOB_STATUS.FAILED,
-        error: err.message.slice(0, 500),
-        finished_at: retryable ? null : nowIso(),
-      });
-      qlog.warn(retryable ? 'retrying' : 'failed', { id: job.id, type: job.type, error: err.message, attempt: attempts });
+      const current = this.repo.get('analysis_jobs', job.id) || {};
+      // A cancelled job keeps its own status. Overwriting 已取消 with 失败 would make the history
+      // claim the project is broken when what actually happened is that a person pressed 取消.
+      if (this.cancelled.has(job.id) || current.status === JOB_STATUS.CANCELLED) {
+        this.repo.update('analysis_jobs', job.id, { status: JOB_STATUS.CANCELLED, finished_at: nowIso(), error: 'cancelled by user' });
+        qlog.info('cancelled', { id: job.id, type: job.type });
+      } else {
+        const attempts = current.attempts || 1;
+        const retryable = attempts < (job.max_attempts || 2);
+        this.repo.update('analysis_jobs', job.id, {
+          status: retryable ? JOB_STATUS.QUEUED : JOB_STATUS.FAILED,
+          error: err.message.slice(0, 500),
+          finished_at: retryable ? null : nowIso(),
+        });
+        qlog.warn(retryable ? 'retrying' : 'failed', { id: job.id, type: job.type, error: err.message, attempt: attempts });
+      }
     } finally {
       timeout.cancel();
       this.running.delete(job.id);
+      this.controllers.delete(job.id);
       this.cancelled.delete(job.id);
     }
   }

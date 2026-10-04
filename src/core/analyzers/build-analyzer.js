@@ -19,8 +19,9 @@ export class BuildAnalyzer {
   /**
    * @param {{root:string, metadata:object}} project
    * @param {string} kind build | lint | typecheck
+   * @param {{signal?:AbortSignal}} [options] aborts the child process when the job is cancelled
    */
-  async run(project, kind = 'build') {
+  async run(project, kind = 'build', { signal = null } = {}) {
     const detected = detectCommand(project.metadata, kind);
     const ts = nowIso();
 
@@ -46,11 +47,13 @@ export class BuildAnalyzer {
       cwd: project.root,
       timeoutMs: this.buildTimeoutMs,
       purpose: `${kind} command for project`,
+      signal,
     });
 
     let status = BUILD_STATUS.UNKNOWN;
     if (res.blocked) status = BUILD_STATUS.UNKNOWN;
     else if (res.timedOut) status = BUILD_STATUS.TIMEOUT;
+    else if (res.cancelled) status = BUILD_STATUS.UNKNOWN;
     else if (res.executableMissing) status = BUILD_STATUS.UNSUPPORTED;
     else if (res.exitCode === 0) status = BUILD_STATUS.PASS;
     else if (typeof res.exitCode === 'number' && res.exitCode > 0) status = BUILD_STATUS.FAIL;
@@ -63,8 +66,9 @@ export class BuildAnalyzer {
       status,
       exitCode: res.exitCode,
       durationMs: res.durationMs,
+      cancelled: !!res.cancelled,
       stdoutSummary: summarizeOutput(res.stdout, 1600),
-      stderrSummary: summarizeOutput(res.stderr, 1600),
+      stderrSummary: summarizeOutput(res.stderr, 2400),
       truncated: !!res.truncated,
       timedOut: !!res.timedOut,
       blocked: !!res.blocked,

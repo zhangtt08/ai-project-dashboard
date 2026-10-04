@@ -61,9 +61,14 @@ export const api = {
 
   scan: (id, b) => request('POST', `/api/projects/${id}/scan`, b),
   scanSync: (id, b) => request('POST', `/api/projects/${id}/scan-sync`, b),
-  jobs: () => request('GET', '/api/jobs'),
+  jobs: (status) => request('GET', `/api/jobs?limit=200${status ? `&status=${encodeURIComponent(status)}` : ''}`),
   cancelJob: (id) => request('POST', `/api/jobs/${id}/cancel`),
   jobsStats: () => request('GET', '/api/jobs/stats'),
+  jobsExport: (status) => request('GET', `/api/jobs/export?limit=2000${status ? `&status=${encodeURIComponent(status)}` : ''}`),
+
+  /** 失效路径：提案（只读）与应用（用户已确认）。 */
+  relocatePreview: () => request('GET', '/api/projects/relocate/preview'),
+  relocate: (moves) => request('POST', '/api/projects/relocate', { moves }),
 
   tasks: (id) => request('GET', `/api/projects/${id}/tasks`),
   addTask: (id, b) => request('POST', `/api/projects/${id}/tasks`, b),

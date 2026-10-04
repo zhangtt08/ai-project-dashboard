@@ -5,6 +5,7 @@ import { Router } from '../router.js';
 import { renderImportPanel } from './dropzone.js';
 import { openImportDialog } from './import.js';
 import { openDeleteDialog } from './delete-dialog.js';
+import { mountRelocatePanel } from './relocate.js';
 
 export async function render() {
   setTopbar('项目', '注册本地工作区——分析过程只读，删除需要你明确确认。', [
@@ -29,8 +30,12 @@ export async function render() {
     const paint = () => sections.replaceChildren(...sectionsFor(filtered(cards)));
     const bar = filterBar(cards, paint);
     paint();
+    // 失效路径集中处理区：一行一条坏消息不如一个能改路径的入口。
+    const relocateBox = h('div', { class: 'stack-sm' });
+    mountRelocatePanel(relocateBox, () => render());
     return h('div', { class: 'stack' }, [
       renderImportPanel({ compact: true }),
+      relocateBox,
       bar,
       sections,
     ]);
@@ -138,20 +143,28 @@ function projectTable(cards) {
     ]) },
     { label: '建议', render: (r) => (r.suggestionCount ? h('a', { class: 'badge badge-unknown', href: `#/projects/${r.id}/suggestions`, title: r.suggestionSummary && r.suggestionSummary.top[0] ? r.suggestionSummary.top[0] : '', text: `${r.suggestionCount} 条` }) : '—') },
     { label: '操作', render: (r) => h('div', { class: 'row' }, [
-      h('button', { class: 'btn btn-sm', text: '扫描', onClick: (e) => { e.stopPropagation(); scan(r.id); } }),
+      h('button', { class: 'btn btn-sm', text: '扫描', onClick: (e) => { e.stopPropagation(); scan(r.id, e.target); } }),
       h('button', { class: 'btn btn-sm', text: '整理', onClick: (e) => { e.stopPropagation(); openProjectSettings(r); } }),
       h('button', { class: 'btn btn-sm btn-danger', text: '删除', onClick: (e) => { e.stopPropagation(); openDeleteDialog(r, { onDone: () => render() }); } }),
     ]) },
   ], cards, { empty: filter.q || filter.category !== 'all' ? '没有符合筛选条件的项目。' : '暂无项目。' });
 }
-async function scan(projectId) {
+async function scan(projectId, btn) {
+  // 全量扫描 = 在这个目录里真的跑构建与测试，点错一次就占用这台机器几分钟。
+  if (!window.confirm('全量扫描会在这个目录里真的执行构建、Lint、类型检查与测试命令，可能需要几分钟。现在就开始吗？')) return;
+  if (btn) btn.disabled = true;
   try {
-    toast('全量扫描已入队——正在执行构建与测试…', 'info', 6000);
-    await api.scan(projectId, { mode: 'full', runCommands: true, suites: ['unit', 'e2e'] });
-    toast('扫描已入队，可在“分析队列”查看进度。', 'ok');
-    setTimeout(() => { refreshShellData(); }, 1500);
+    const out = await api.scan(projectId, { mode: 'full', runCommands: true, suites: ['unit', 'e2e'] });
+    if (out.deduped) {
+      toast(`这个项目已经有扫描在${out.status === 'running' ? '运行中' : '排队中'}——不会重复开始第二次。`, 'info', 5000);
+    } else {
+      state.scanPending.add(projectId);
+      toast('全量扫描已入队——可在「分析队列」查看进度。', 'ok', 6000);
+    }
+    setTimeout(() => { refreshShellData(); render(); }, 1500);
   } catch (err) {
     toast(`扫描入队失败：${err.message}`, 'error');
+    if (btn) btn.disabled = false;
   }
 }
 

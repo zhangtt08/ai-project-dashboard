@@ -95,6 +95,31 @@ export const AUTO_ALLOWED_SUMMARY = [
 
 const EXECUTABLE_CACHE = new Map();
 
+/**
+ * Kill a command and everything it spawned.
+ *
+ * `child.kill()` only reaches the direct child. On Windows `npm run build` is a wrapper: the
+ * thing that actually compiles and tests is its grandchild, so a cancelled scan used to leave
+ * the real build running behind a card that said 已取消 — and the next scan would race it.
+ * `taskkill /T /F` walks the tree. It is invoked here as internal teardown only: `taskkill`
+ * stays on DANGEROUS_BINARIES, so no user-detected command can ever reach it.
+ */
+export function killProcessTree(pid, { force = true } = {}) {
+  if (!pid) return false;
+  if (process.platform === 'win32') {
+    try {
+      const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])], {
+        windowsHide: true, stdio: 'ignore', shell: false,
+      });
+      killer.on('error', () => { /* fall back below is already done by the caller */ });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try { process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM'); return true; } catch { return false; }
+}
+
 export function resolveExecutable(bin) {
   if (EXECUTABLE_CACHE.has(bin)) return EXECUTABLE_CACHE.get(bin);
   const win = process.platform === 'win32';
@@ -186,9 +211,13 @@ export class CommandRunner {
   }
 
   /**
-   * @param {{command:string,args?:string[],cwd:string,timeoutMs?:number,purpose?:string,detachedSafe?:boolean}} req
+   * @param {{command:string,args?:string[],cwd:string,timeoutMs?:number,purpose?:string,detachedSafe?:boolean,signal?:AbortSignal}} req
+   *
+   * `signal` is what makes cancellation real: an aborted job kills its child process instead
+   * of merely forgetting about it. Without this, cancelling a scan leaves the project's own
+   * build/test running to completion — which is the opposite of what the button says.
    */
-  async run({ command, args = [], cwd, timeoutMs, purpose = 'unspecified', env = null }) {
+  async run({ command, args = [], cwd, timeoutMs, purpose = 'unspecified', env = null, signal = null }) {
     const started = Date.now();
     const verdict = classifyCommand(command, args);
     const base = {
@@ -197,6 +226,12 @@ export class CommandRunner {
       purpose,
       requestedAt: new Date().toISOString(),
     };
+
+    if (signal?.aborted) {
+      const record = { ...base, allowed: true, blocked: false, klass: verdict.klass, exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '任务已取消，未启动该命令。', durationMs: 0, truncated: false, cancelled: true };
+      this.#audit(record);
+      return record;
+    }
 
     if (!verdict.allowed) {
       const record = {
@@ -279,9 +314,23 @@ export class CommandRunner {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        killProcessTree(child.pid);
         resolve({ exitCode: null, signal: 'SIGKILL', stdout, stderr, truncated, timedOut: true });
       }, limit);
+
+      // Cancellation must reach the child process tree, not just the promise. SIGKILL because a
+      // build/test tree spawned by npm keeps running after a polite SIGTERM on Windows.
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        killProcessTree(child.pid);
+        resolve({ exitCode: null, signal: 'SIGKILL', stdout, stderr, truncated, timedOut: false, cancelled: true });
+      };
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       child.on('error', (err) => {
         if (settled) return;
@@ -290,11 +339,12 @@ export class CommandRunner {
         resolve({ exitCode: -4, signal: null, stdout, stderr: stderr + `\n${err.message}`, truncated, timedOut: false });
       });
 
-      child.on('close', (code, signal) => {
+      child.on('close', (code, signal2) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve({ exitCode: code, signal, stdout, stderr, truncated, timedOut: false });
+        if (signal) signal.removeEventListener('abort', onAbort);
+        resolve({ exitCode: code, signal: signal2, stdout, stderr, truncated, timedOut: false });
       });
 
       this.history.push({ pid: child.pid, command: base.command, cwd, startedAt: new Date().toISOString() });
@@ -315,6 +365,7 @@ export class CommandRunner {
       durationMs: Date.now() - started,
       truncated: !!result.truncated,
       timedOut: !!result.timedOut,
+      cancelled: !!result.cancelled,
       shimmed: !!shimmed,
       ok: result.exitCode === 0 && !result.timedOut,
     };

@@ -96,7 +96,7 @@ export class ProjectScanner {
   /**
    * @param {string} root absolute workspace path
    */
-  async scan(root, { userPatterns = [], limits = {}, name = null } = {}) {
+  async scan(root, { userPatterns = [], limits = {}, name = null, signal = null } = {}) {
     const started = Date.now();
     const lim = { ...this.limits, ...limits };
     resetReadAudit();
@@ -116,13 +116,18 @@ export class ProjectScanner {
     const sensitiveFiles = [];
     const largestFiles = [];
     let truncated = false;
+    // A cancelled scan must stop walking, not keep reading the disk behind a job that already
+    // says 已取消. `aborted` is reported back so the orchestrator can refuse to persist a
+    // half-read tree as if it were a complete observation.
+    let aborted = false;
 
     const walk = async (dirAbs, dirRel, depth) => {
-      if (truncated) return;
+      if (signal && signal.aborted) { aborted = true; return; }
+      if (truncated || aborted) return;
       if (depth > lim.maxDepth) { truncated = true; warnings.push(`maxDepth ${lim.maxDepth} reached`); return; }
       const entries = await readDirSafe(dirAbs);
       for (const entry of entries) {
-        if (truncated) return;
+        if (truncated || aborted) return;
         const rel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
         if (entry.isSymbolicLink()) continue;
         if (entry.isDirectory()) {
@@ -242,6 +247,7 @@ export class ProjectScanner {
 
     const markdownDocs = [];
     for (const f of files) {
+      if (aborted) break;
       if (f.ext === '.md' || f.ext === '.mdx') {
         const r = await readWorkspaceText(root, f.path, { maxBytes: 256 * 1024 });
         const base = f.path.split('/').pop();
@@ -283,7 +289,7 @@ export class ProjectScanner {
       monorepoPackages: relPaths.some((p) => /^packages\//.test(p)),
     };
 
-    const todos = await this.#collectMarkers(root, files, lim);
+    const todos = await this.#collectMarkers(root, files, lim, signal);
 
     const fingerprintInput = files
       .slice()
@@ -303,6 +309,7 @@ export class ProjectScanner {
       scannedAt: nowIso(),
       durationMs: Date.now() - started,
       truncated,
+      aborted,
       warnings,
       fileCount: files.length,
       dirCount: dirs.length,
@@ -333,11 +340,12 @@ export class ProjectScanner {
     };
   }
 
-  async #collectMarkers(root, files, lim) {
+  async #collectMarkers(root, files, lim, signal = null) {
     const out = [];
     const candidates = files.filter((f) => ['source', 'test', 'e2e', 'unknown'].includes(f.role) && f.sizeBytes <= 512 * 1024);
     const limit = Math.min(candidates.length, 2000);
     for (let i = 0; i < limit; i += 1) {
+      if (signal && signal.aborted) return out;
       const f = candidates[i];
       const r = await readWorkspaceText(root, f.path, { maxBytes: 512 * 1024 });
       if (!r.ok) continue;

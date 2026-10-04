@@ -2,49 +2,23 @@ import { api } from '../api.js';
 import { h, metric, card, healthBadge, stateEmpty, mountAsync, fmt } from '../ui.js';
 import { setTopbar } from '../app.js';
 import { openImportDialog } from './import.js';
+import { mountRelocatePanel } from './relocate.js';
+import { SEV_ZH, actionFor, actionHref, topItemByProject } from './attention-actions.js';
 
 /**
  * 首页 = 决策视图。
  *
- * 过去这一页把全部受管项目摊成一张长卡片列表，"现在该干什么"要人自己一行行找。现在收成两档：
- *   1. 需要现在动手的项目 —— 每个只给一个主动作，动作指向那个已经核实过的原因（构建失败、
- *      目录丢失、N 个测试不通过……），不出现分数、置信度或百分比式的伪判定。
- *   2. 其余项目 —— 折叠成一行一个的紧凑清单，每个项目仍然一次点击可达；一条路由、一份数据都没删。
+ * 过去这一页把全部受管项目摊成一张长卡片列表，"现在该干什么"要人自己一行行找。现在收成三档：
+ *   1. 失效路径 —— 同一件事造成 N 条记录打不开时，一条批量出路比 N 行重复的"目录已丢失"有用。
+ *   2. 需要现在动手的项目 —— 每个只给一个主动作，动作指向那个已经核实过的原因（构建失败、
+ *      N 个测试不通过……），不出现分数、置信度或百分比式的伪判定。
+ *   3. 其余项目 —— 折叠成一行一个的紧凑清单，每个项目仍然一次点击可达；一条路由、一份数据都没删。
  */
 
 const SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3 };
-const SEV_ZH = { critical: '危急', high: '高', medium: '中', low: '低' };
-
-/** 每个"需要关注"的项目只呈现一个主动作：由该项目严重度最高的那条观察决定它跳去哪。 */
-const ACTION_BY_KIND = {
-  workspace_missing: { label: '修正路径或归档', tab: 'settings' },
-  critical_health: { label: '查看健康明细', tab: 'overview' },
-  build_fail: { label: '查看构建输出', tab: 'quality' },
-  test_fail: { label: '查看失败测试', tab: 'quality' },
-  test_error: { label: '查看测试输出', tab: 'quality' },
-  regression: { label: '对比最近快照', tab: 'quality' },
-  blocked_task: { label: '处理阻塞任务', tab: 'work' },
-  risk: { label: '分诊风险', tab: 'quality' },
-  dirty_workspace: { label: '检查工作区改动', tab: 'quality' },
-  drift: { label: '核对规范漂移', tab: 'overview' },
-  pending_review: { label: '查看待执行提示词', tab: 'ai' },
-};
-
-/** 关注项按严重度排好序后，同一项目第一次出现的就是它最严重的那条。 */
-function topItemByProject(items) {
-  const map = new Map();
-  for (const it of items) if (!map.has(it.projectId)) map.set(it.projectId, it);
-  return map;
-}
-
-function actionFor(item, nextAction) {
-  const hit = ACTION_BY_KIND[item.kind];
-  if (hit) return hit;
-  return nextAction ? { label: '查看下一步行动', tab: 'overview' } : { label: '打开项目', tab: 'overview' };
-}
 
 function decisionRow(cardData, item) {
-  const action = actionFor(item, cardData.nextAction);
+  const action = actionFor(item, cardData);
   return h('div', { class: `risk-item decision-row sev-${item.severity}` }, [
     h('div', { class: 'decision-body' }, [
       h('div', { class: 'row wrap' }, [
@@ -54,9 +28,9 @@ function decisionRow(cardData, item) {
       ]),
       h('div', { class: 'small', text: fmt.truncate(item.title, 140) }),
       item.detail ? h('div', { class: 'small muted', text: fmt.truncate(item.detail, 160) }) : null,
-      item.at ? h('div', { class: 'small muted alert-time', title: `观察时间 ${fmt.date(item.at)}`, text: `观察于 ${fmt.rel(item.at)}` }) : null,
+      item.at ? h('div', { class: 'small muted alert-time', title: `观察时间 ${fmt.date(item.at)}`, text: `观察于 ${fmt.rel(item.at)}` }) : h('div', { class: 'small muted alert-time', text: '观察时间：没有记录' }),
     ]),
-    h('a', { class: 'btn btn-sm btn-primary', href: `#/projects/${cardData.id}/${action.tab}`, text: action.label }),
+    h('a', { class: 'btn btn-sm btn-primary', href: actionHref(item, cardData.id), text: action.label }),
   ]);
 }
 
@@ -84,11 +58,13 @@ export async function render() {
     const topByProject = topItemByProject(items);
 
     // 只有危急 / 高 的观察才进入决策视图；中 / 低 与"没有事项"的项目收进折叠清单，不删除任何入口。
+    // 目录丢失单独成区（下面那块可以逐个或批量改路径），不在决策列表里重复 N 行同样的话。
     const attentionProjectIds = new Set();
     const decisions = [];
     for (const cardData of data.cards) {
       const top = topByProject.get(cardData.id);
-      if (top && (top.severity === 'critical' || top.severity === 'high' || cardData.workspaceMissing)) {
+      if (cardData.workspaceMissing) continue;
+      if (top && (top.severity === 'critical' || top.severity === 'high')) {
         decisions.push({ cardData, item: top });
         attentionProjectIds.add(cardData.id);
       }
@@ -100,9 +76,9 @@ export async function render() {
       metric('项目数', fmt.num(c.total), { foot: `${c.archived} 个已归档` }),
       metric('健康', fmt.num(c.healthy), { cls: 'ok' }),
       metric('警告', fmt.num(c.warning), { cls: c.warning ? 'warn' : '' }),
-      metric('危急', fmt.num(c.critical), { cls: c.critical ? 'alert' : '', foot: c.missing ? `${c.missing} 个目录已丢失` : undefined }),
+      metric('危急', fmt.num(c.critical), { cls: c.critical ? 'alert' : '', foot: c.missing ? `${c.missing} 个目录已丢失` : '没有记录丢失的目录' }),
       metric('阻塞', fmt.num(c.blocked), { cls: c.blocked ? 'alert' : '' }),
-      metric('需要动手', fmt.num(decisions.length), { cls: decisions.length ? 'alert' : 'ok', foot: `另有 ${items.length} 条关注项` }),
+      metric('需要动手', fmt.num(decisions.length + c.missing), { cls: (decisions.length + c.missing) ? 'alert' : 'ok', foot: `另有 ${items.length} 条关注项` }),
     ]);
 
     const decisionSection = decisions.length
@@ -122,8 +98,13 @@ export async function render() {
       ])
       : null;
 
+    // 失效路径区自己读磁盘，异步挂进来：一次移动打断 9 条记录时，这里给出的是出路，不是第 9 遍坏消息。
+    const relocateBox = h('div', { class: 'stack-sm', id: 'relocate-box' });
+    mountRelocatePanel(relocateBox, () => render());
+
     return h('div', { class: 'stack' }, [
       metrics,
+      relocateBox,
       decisionSection,
       restSection,
       h('div', { class: 'row wrap' }, [

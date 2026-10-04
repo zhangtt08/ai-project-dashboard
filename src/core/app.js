@@ -292,6 +292,67 @@ export class App {
     return updated;
   }
 
+  /**
+   * 失效路径的重新定位计划。只探测磁盘，不写任何东西 —— 返回的是给人确认的提案。
+   *
+   * Why this exists: when a whole folder tree is moved (Desktop/项目/…), every record breaks at
+   * once and the panel answers 9 identical critical rows with no way forward. The honest remedy
+   * is to look for where those folders actually are now and offer it, one click per project.
+   */
+  async relocationPlan() {
+    const all = this.repo.list('projects', {});
+    const claimed = new Map(all.map((p) => [toPosix(p.workspace_path).toLowerCase(), p.name]));
+    const configured = this.#searchRoots();
+    const projects = all.filter((p) => !p.archived_at).map((p) => ({ id: p.id, name: p.name, workspacePath: p.workspace_path }));
+    const { planRelocations: plan } = await import('./workspace-resolver.js');
+    return plan(projects, { roots: configured, claimed });
+  }
+
+  /**
+   * Apply confirmed relocations. Writes go through `setWorkspacePath` — the same single path a
+   * manual edit uses, including its existence check and its clearing of stale verdicts. Nothing
+   * here is a second rulebook: one write path, so the two entry points cannot drift.
+   */
+  async applyRelocations(moves) {
+    const results = [];
+    for (const move of moves) {
+      const projectId = String(move && move.projectId || '');
+      const project = this.repo.get('projects', projectId);
+      if (!project) { results.push({ projectId, ok: false, reason: '项目记录不存在' }); continue; }
+      const target = String(move && move.newPath || '').trim();
+      if (!target) { results.push({ projectId, name: project.name, ok: false, reason: '没有给出新路径' }); continue; }
+      try {
+        this.setWorkspacePath(projectId, target);
+        let rescan = null;
+        try { await this.orchestrator.quickScan(projectId); rescan = 'ok'; } catch (err) { rescan = err.message; }
+        const after = this.repo.get('projects', projectId);
+        results.push({
+          projectId, name: project.name, ok: true,
+          from: toPosix(project.workspace_path), to: toPosix(after.workspace_path),
+          onDisk: fs.existsSync(after.workspace_path), quickScan: rescan,
+        });
+      } catch (err) {
+        results.push({ projectId, name: project.name, ok: false, reason: err.message, hint: err.hint || null });
+      }
+    }
+    return {
+      applied: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+      at: nowIso(),
+    };
+  }
+
+  #searchRoots() {
+    const raw = this.repo.getSetting('workspace.searchRoots');
+    if (!raw) return null;
+    try {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr) && arr.length) return arr.map(String).slice(0, 12);
+    } catch { /* fall back to the default roots */ }
+    return null;
+  }
+
   /** Import + classify. Publishing runs in the background: a project must appear in the UI
    * the moment it is added, and a slow or unreachable GitHub must never stall an import —
    * first-run discovery can queue twenty projects at once.

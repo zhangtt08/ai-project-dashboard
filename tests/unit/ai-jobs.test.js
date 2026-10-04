@@ -156,7 +156,9 @@ describe('Database + Repository', () => {
     const first = db.migrate();
     assert.deepEqual(first.applied, []);
     const versions = db.all('SELECT version FROM schema_migrations ORDER BY version').map((r) => Number(r.version));
-    assert.deepEqual(versions, [1, 2, 3, 4]);
+    // v5 (`job_progress`) is part of the registry: the queue persists which step a running scan is
+    // on, and that has to survive a page reload. Keep this list in step with `allMigrations()`.
+    assert.deepEqual(versions, [1, 2, 3, 4, 5]);
     assert.equal(db.ftsAvailable, true);
   });
 

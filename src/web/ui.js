@@ -173,7 +173,7 @@ export function card(title, body, { actions = [], hint = '', id = null } = {}) {
   ]);
 }
 
-export function table(columns, rows, { empty = 'No rows.', rowKey = null, onRowClick = null } = {}) {
+export function table(columns, rows, { empty = '没有记录。', rowKey = null, onRowClick = null } = {}) {
   if (!rows || !rows.length) return stateEmpty(empty);
   const thead = h('thead', {}, h('tr', {}, columns.map((c) => h('th', { class: c.num ? 'num' : '', style: c.width ? { width: c.width } : {}, text: c.label }))));
   const tbody = h('tbody', {}, rows.map((r, i) => h('tr', {
@@ -286,7 +286,7 @@ export function copyButton(text, label = '复制') {  return h('button', {
  * Load data and render, always exposing loading / empty / success / error states
  * (requirement #51). `renderer` may return a node, or null after mutating the container.
  */
-export async function mountAsync(container, loader, renderer, { loadingLabel = 'Loading…', onError = null } = {}) {
+export async function mountAsync(container, loader, renderer, { loadingLabel = '正在加载…', onError = null } = {}) {
   clear(container);
   container.appendChild(stateLoading(loadingLabel));
   try {

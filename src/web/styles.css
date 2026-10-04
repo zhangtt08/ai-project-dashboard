@@ -566,3 +566,44 @@ code.inline { font-family: "Cascadia Code", Consolas, ui-monospace, monospace; f
   background: #cf3f4f !important;
   color: #fff !important;
 }
+
+/* ── 失效路径的重新定位面板 ─────────────────────────────────────────────
+   Only existing tokens: spacing follows the 4px rhythm used by .card / .risk-item. */
+.relocate-card { border-left: 3px solid var(--amber); }
+.relocate-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: start;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.relocate-row:last-child { border-bottom: 0; }
+.relocate-main { min-width: 0; display: grid; gap: 4px; }
+.relocate-cand {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.relocate-cand code { max-width: 100%; overflow-wrap: anywhere; }
+.relocate-cand.is-blocked { opacity: 0.72; }
+.relocate-foot { padding-top: 8px; }
+@media (max-width: 760px) {
+  .relocate-row { grid-template-columns: 1fr; }
+  .relocate-row .row { justify-content: flex-start; }
+}
+
+/* ── 关注中心：每条一个主动作 ───────────────────────────────────────── */
+.attention-item { display: grid; gap: 4px; }
+.attention-item .btn { white-space: nowrap; }
+
+/* ── 队列：筛选条 + 真实步骤进度 ────────────────────────────────────── */
+.filter-bar { gap: 6px; }
+.job-progress { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* ── 窄屏不许横向滚动：长路径与长命令自己折行 ───────────────────────── */
+.path, .relocate-cand code, .decision-row .small, .attention-item .small {
+  overflow-wrap: anywhere;
+}

@@ -422,6 +422,21 @@ export const MIGRATION_4 = {
   ],
 };
 
+/**
+ * v5: 分析队列要能报告进度。
+ *
+ * A scan that runs for minutes with no signal is indistinguishable from one that hung, so the
+ * queue persists which step it is on. `started_at` already exists; the missing piece is the
+ * step label, which has to survive a page reload — hence a column, not in-memory state.
+ */
+export const MIGRATION_5 = {
+  version: 5,
+  name: 'job_progress',
+  up: [
+    `ALTER TABLE analysis_jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}';`,
+  ],
+};
+
 /** FTS5 is optional — probed at runtime, with LIKE fallback (KNOWN_ISSUES TODO-P2-005). */
 export const FTS_MIGRATION = {
   version: 2,
@@ -435,6 +450,6 @@ export const FTS_MIGRATION = {
 };
 
 export function allMigrations({ ftsAvailable }) {
-  const core = [...MIGRATIONS, MIGRATION_3, MIGRATION_4];
-  return ftsAvailable ? [...MIGRATIONS, FTS_MIGRATION, MIGRATION_3, MIGRATION_4] : core;
+  const core = [...MIGRATIONS, MIGRATION_3, MIGRATION_4, MIGRATION_5];
+  return ftsAvailable ? [...MIGRATIONS, FTS_MIGRATION, MIGRATION_3, MIGRATION_4, MIGRATION_5] : core;
 }

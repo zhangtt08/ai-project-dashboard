@@ -276,7 +276,15 @@ def suggestions(page):
     assert "分类" in body, "the identification card must state the category"
     assert "分类依据" in body, "the identification card must expose the evidence behind the category"
     # suggestions exist and every one of them cites evidence — no advice without a source
-    page.wait_for_selector(".sugg-item", timeout=20000)
+    # 建议面板会随后台数据异步重渲染，实测会闪过一帧空列表（2026-10-02）：
+    # 等到连续两帧都稳定非空再数，别把过渡态当成"没有建议"。
+    page.wait_for_function(
+        """() => new Promise(resolve => {
+          const count = () => document.querySelectorAll('.sugg-item').length;
+          const n = count();
+          if (n < 1) return resolve(false);
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve(count() === n)));
+        })""", timeout=20000)
     items = page.locator(".sugg-item")
     assert items.count() >= 1, "a demo project with known gaps should yield suggestions"
     for i in range(items.count()):
@@ -321,7 +329,9 @@ def delete_preview(page):
     page.locator(".modal button:has-text('永久删除记录与源文件')").click()
     expect(modal).to_contain_text(re.compile("请输入「|不能清除源目录"), timeout=5000)
     rows_before = page.locator("tbody tr").count()
-    page.locator(".modal button:has-text('取消')").click()
+    # :has-text 是子串匹配，会同时命中「取消彻底删除」—— 收起彻底删除子步骤的
+    # 那颗按钮（2026-10-02 实测踩到）。关整个模态要点的是精确的「取消」。
+    modal.get_by_role("button", name="取消", exact=True).click()
     expect(page.locator(".modal")).to_have_count(0, timeout=5000)
     assert page.locator("tbody tr").count() == rows_before, "the preview must not remove any project"
 

@@ -18,6 +18,40 @@ const log = logger.child('orchestrator');
 
 const RUN_SEVERITY = ['pass', 'unknown', 'unsupported', 'skipped', 'timeout', 'error', 'fail'];
 
+/**
+ * The step list a full scan walks through. Progress is an index into THIS list, so the UI can
+ * say "第 6/15 步：构建" — a statement about real code paths, not an estimated percentage.
+ */
+export const FULL_SCAN_STEPS = [
+  '扫描文件', '读取 Git 状态', '解析规范文档', '提取任务', '规划阶段',
+  '构建', 'Lint', '类型检查', '测试', '风险', '回归', '漂移',
+  '健康与快照', '分类与建议', '写入项目记忆',
+];
+
+export class CancelledError extends Error {
+  constructor(step) {
+    super(`任务已取消（停在「${step}」）`);
+    this.name = 'CancelledError';
+    this.step = step;
+  }
+}
+
+function makeProgress(ctx, steps) {
+  const report = typeof ctx.report === 'function' ? ctx.report : () => {};
+  let index = 0;
+  const total = steps.length;
+  return {
+    step(label) {
+      const i = Math.max(0, steps.indexOf(label));
+      index = i + 1;
+      report({ step: index, total, label, steps: total });
+    },
+    guard() {
+      if (ctx.signal && ctx.signal.aborted) throw new CancelledError(steps[Math.max(0, index - 1)] || steps[0]);
+    },
+  };
+}
+
 /** Commands the user pinned by hand (metadata.manualCommands) win over detection. */
 function projectManualCommands(project) {
   return (project && project.metadata && project.metadata.manualCommands) || {};
@@ -51,12 +85,14 @@ export class Orchestrator {
   }
 
   /** Cheap scan: metadata + git only. */
-  async quickScan(projectId) {
+  async quickScan(projectId, ctx = {}) {
     const project = this.#project(projectId);
     this.events.record(projectId, EVENT_TYPE.SCAN_STARTED, 'Quick scan started', { kind: 'quick' });
     const metadata = await this.scanner.scan(project.workspace_path, {
       userPatterns: project.ignore_patterns || [],
+      signal: ctx.signal || null,
     });
+    if (metadata.aborted) throw new CancelledError('扫描文件');
     // A scan that read nothing must not be recorded as an analysis: stamping last_analyzed_at or
     // overwriting the language/repo fields here would assert facts about a folder we cannot open.
     if (!metadata.ok) {
@@ -110,13 +146,19 @@ export class Orchestrator {
    * Full scan: scanner → git → specs → tasks → stages → build → tests → risks →
    * health → gate → snapshot → regressions → memory.
    */
-  async fullScan(projectId, { runCommands = true, suites = ['unit', 'integration', 'e2e'] } = {}) {
+  async fullScan(projectId, { runCommands = true, suites = ['unit', 'integration', 'e2e'] } = {}, ctx = {}) {
     const project = this.#project(projectId);
     const started = Date.now();
+    const prog = makeProgress(ctx, FULL_SCAN_STEPS);
     this.events.record(projectId, EVENT_TYPE.SCAN_STARTED, 'Full scan started', { kind: 'full' });
 
     // 1. Scanner
-    const metadata = await this.scanner.scan(project.workspace_path, { userPatterns: project.ignore_patterns || [] });
+    prog.step('扫描文件');
+    const metadata = await this.scanner.scan(project.workspace_path, {
+      userPatterns: project.ignore_patterns || [],
+      signal: ctx.signal || null,
+    });
+    if (metadata.aborted) throw new CancelledError('扫描文件');
     if (!metadata.ok) {
       this.events.record(projectId, EVENT_TYPE.SCAN_FAILED, `Full scan failed: ${metadata.reason}`, { reason: metadata.reason }, { level: 'error' });
       throw new WorkspaceError(`workspace scan failed: ${metadata.reason}`, '项目目录已不存在或读不到——在「整理」里改成新位置后重新分析，或删除这条记录。');
@@ -124,6 +166,7 @@ export class Orchestrator {
     metadata.manualCommands = projectManualCommands(project);
 
     // 2. Git
+    prog.step('读取 Git 状态'); prog.guard();
     const git = await this.gitAnalyzer.analyze(project.workspace_path, { includeDiff: true, recentCommitCount: 15 });
     const gitSnapshot = this.repo.insert('git_snapshots', {
       id: newId('gts'),
@@ -147,6 +190,7 @@ export class Orchestrator {
     });
 
     // 3. Specification
+    prog.step('解析规范文档'); prog.guard();
     const specResult = await this.specManager.analyze({ root: project.workspace_path, metadata });
     this.repo.removeWhere('specifications', { project_id: projectId });
     this.repo.removeWhere('acceptance_criteria', { project_id: projectId });
@@ -178,12 +222,14 @@ export class Orchestrator {
     }));
 
     // 4. Tasks
+    prog.step('提取任务'); prog.guard();
     const sessions = this.repo.list('agent_sessions', { project_id: projectId });
     const derived = this.taskLedger.derive({ specs: savedSpecs, criteria: savedCriteria, metadata, sessions });
     const taskSync = this.taskLedger.sync(projectId, derived);
     let tasks = this.repo.list('tasks', { project_id: projectId });
 
     // 5. Stages
+    prog.step('规划阶段'); prog.guard();
     const planned = this.stageManager.plan({ specs: savedSpecs, tasks, acceptance: savedCriteria });
     const stageResult = this.stageManager.sync(projectId, planned);
     tasks = this.repo.list('tasks', { project_id: projectId });
@@ -195,15 +241,21 @@ export class Orchestrator {
     let lint = null;
     let typecheck = null;
     if (runCommands) {
-      build = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, 'build');
-      lint = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, 'lint');
-      typecheck = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, 'typecheck');
+      prog.step('构建'); prog.guard();
+      build = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, 'build', { signal: ctx.signal || null });
+      if (build.cancelled) throw new CancelledError('构建');
+      prog.step('Lint'); prog.guard();
+      lint = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, 'lint', { signal: ctx.signal || null });
+      if (lint.cancelled) throw new CancelledError('Lint');
+      prog.step('类型检查'); prog.guard();
+      typecheck = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, 'typecheck', { signal: ctx.signal || null });
+      if (typecheck.cancelled) throw new CancelledError('类型检查');
       for (const [kind, res] of [['build', build], ['lint', lint], ['typecheck', typecheck]]) {
         this.repo.insert('build_results', {
           id: newId('bld'), project_id: projectId, kind,
           command: res.command || '(unsupported)', status: res.status, exit_code: res.exitCode,
-          duration_ms: res.durationMs, stdout_summary: truncate(res.stdoutSummary, 1200),
-          stderr_summary: truncate(res.stderrSummary, 1200), truncated: res.truncated,
+          duration_ms: res.durationMs, stdout_summary: res.stdoutSummary,
+          stderr_summary: res.stderrSummary, truncated: res.truncated,
           unsupported_reason: res.unsupportedReason || '', ts: res.ts,
         });
       }
@@ -215,8 +267,10 @@ export class Orchestrator {
     // 7. Tests
     const tests = {};
     if (runCommands) {
+      prog.step('测试'); prog.guard();
       for (const suite of suites) {
-        const run = await this.testAnalyzer.runSuite({ root: project.workspace_path, metadata }, suite);
+        const run = await this.testAnalyzer.runSuite({ root: project.workspace_path, metadata }, suite, { signal: ctx.signal || null });
+        if (run.cancelled) throw new CancelledError(`测试（${suite}）`);
         this.#persistTestRun(projectId, run);
         tests[suite] = run;
       }
@@ -228,6 +282,7 @@ export class Orchestrator {
     }
 
     // 8. Risks
+    prog.step('风险'); prog.guard();
     const previousSnapshot = this.repo.list('project_snapshots', { project_id: projectId }, { orderBy: 'seq DESC', limit: 1 })[0] || null;
     const risksInput = {
       build, unit: tests.unit, integration: tests.integration, e2e: tests.e2e,
@@ -240,6 +295,7 @@ export class Orchestrator {
     risks = this.repo.list('risks', { project_id: projectId }, { orderBy: 'created_at DESC' });
 
     // 9. Regression (needs previous snapshot, computed before risks for accuracy on 2nd pass)
+    prog.step('回归'); prog.guard();
     const failedCases = Object.values(tests).filter(Boolean).flatMap((r) => (r.cases || []).map((c) => ({ ...c, suite: r.suite })));
     const gate = this.acceptanceGate.evaluate({
       stage: currentStage, build, unit: tests.unit, integration: tests.integration, e2e: tests.e2e,
@@ -273,12 +329,14 @@ export class Orchestrator {
     risks = this.repo.list('risks', { project_id: projectId }, { orderBy: 'created_at DESC' });
 
     // 10. Drift
+    prog.step('漂移'); prog.guard();
     const drift = this.driftDetector.detect({
       specs: savedSpecs, criteria: savedCriteria, tasks, git, metadata, previous: previousSnapshot,
       unit: tests.unit, e2e: tests.e2e,
     });
 
     // 11. Health + progress
+    prog.step('健康与快照'); prog.guard();
     const health = this.healthEngine.evaluate({
       build, unit: tests.unit, integration: tests.integration, e2e: tests.e2e,
       risks, tasks, git, gate, regressions: openRegressions, metadata, criteria: savedCriteria,
@@ -347,6 +405,7 @@ export class Orchestrator {
       : null;
     mergedMeta.nextAction = nextAction;
 
+    prog.step('分类与建议'); prog.guard();
     // 13b. 项目分类 / 用途识别 / 可优化建议 — derived only from the evidence gathered above.
     //      A category the user set by hand always wins over the inferred one.
     const classification = classifyProject(metadata, {
@@ -391,6 +450,7 @@ export class Orchestrator {
     });
 
     // 14. Memory version
+    prog.step('写入项目记忆'); prog.guard();
     const memoryResult = this.memoryStore.version(projectId, this.memoryStore.compose({
       project: { ...project, id: projectId, name: project.name, description: project.description },
       metadata, git, specs: savedSpecs, criteria: savedCriteria, tasks, stages,
@@ -566,9 +626,9 @@ export class Orchestrator {
   }
 
   registerHandlers(queue) {
-    queue.register(JOB_TYPE.QUICK_SCAN, async (payload) => this.quickScan(payload.projectId));
-    queue.register(JOB_TYPE.FULL_SCAN, async (payload) => {
-      const result = await this.fullScan(payload.projectId, { runCommands: payload.runCommands !== false, suites: payload.suites });
+    queue.register(JOB_TYPE.QUICK_SCAN, async (payload, ctx = {}) => this.quickScan(payload.projectId, ctx));
+    queue.register(JOB_TYPE.FULL_SCAN, async (payload, ctx = {}) => {
+      const result = await this.fullScan(payload.projectId, { runCommands: payload.runCommands !== false, suites: payload.suites }, ctx);
       return { health: result.health.status, gate: result.gate.result, durationMs: result.durationMs, snapshotSeq: result.snapshot.seq };
     });
     queue.register(JOB_TYPE.GIT, async (payload) => {
@@ -578,15 +638,16 @@ export class Orchestrator {
       this.repo.update('projects', payload.projectId, { metadata: meta, last_analyzed_at: nowIso() });
       return { branch: git.branch, head: git.commitShort, clean: git.workingTreeClean };
     });
-    queue.register(JOB_TYPE.BUILD, async (payload) => {
+    queue.register(JOB_TYPE.BUILD, async (payload, ctx = {}) => {
       const project = this.#project(payload.projectId);
       const metadata = (project.metadata && project.metadata.metadata) || (await this.scanner.scan(project.workspace_path, {}));
       metadata.manualCommands = projectManualCommands(project);
-      const result = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, payload.kind || 'build');
+      const result = await this.buildAnalyzer.run({ root: project.workspace_path, metadata }, payload.kind || 'build', { signal: ctx.signal || null });
+      if (result.cancelled) throw new CancelledError(`命令 ${result.command}`);
       this.repo.insert('build_results', {
         id: newId('bld'), project_id: payload.projectId, kind: result.kind, command: result.command || '(unsupported)',
         status: result.status, exit_code: result.exitCode, duration_ms: result.durationMs,
-        stdout_summary: truncate(result.stdoutSummary, 1200), stderr_summary: truncate(result.stderrSummary, 1200),
+        stdout_summary: result.stdoutSummary, stderr_summary: result.stderrSummary,
         truncated: result.truncated, unsupported_reason: result.unsupportedReason || '', ts: result.ts,
       });
       const meta = { ...(project.metadata || {}) };
@@ -594,18 +655,19 @@ export class Orchestrator {
       this.repo.update('projects', payload.projectId, { metadata: meta });
       return { status: result.status, exitCode: result.exitCode, durationMs: result.durationMs };
     });
-    queue.register(JOB_TYPE.TEST, async (payload) => {
+    queue.register(JOB_TYPE.TEST, async (payload, ctx = {}) => {
       const project = this.#project(payload.projectId);
       const metadata = (project.metadata && project.metadata.metadata) || (await this.scanner.scan(project.workspace_path, {}));
       metadata.manualCommands = projectManualCommands(project);
-      const run = await this.testAnalyzer.runSuite({ root: project.workspace_path, metadata }, payload.suite || 'unit');
+      const run = await this.testAnalyzer.runSuite({ root: project.workspace_path, metadata }, payload.suite || 'unit', { signal: ctx.signal || null });
+      if (run.cancelled) throw new CancelledError(`测试（${payload.suite || 'unit'}）`);
       this.#persistTestRun(payload.projectId, run);
       const meta = { ...(project.metadata || {}), tests: { ...((project.metadata || {}).tests || {}) } };
       meta.tests[run.suite] = this.#runSnapshot(run);
       this.repo.update('projects', payload.projectId, { metadata: meta });
       return { status: run.status, passed: run.passed, total: run.total, failed: run.failed };
     });
-    queue.register(JOB_TYPE.RISK, async (payload) => this.quickScan(payload.projectId));
+    queue.register(JOB_TYPE.RISK, async (payload, ctx = {}) => this.quickScan(payload.projectId, ctx));
     queue.register(JOB_TYPE.AI_ANALYSIS, async (payload) => {
       // AI enrichment is additive: with the provider off (or not wired) this is a
       // graceful skip, never a failed job.

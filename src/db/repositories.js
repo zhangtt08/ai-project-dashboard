@@ -30,7 +30,7 @@ const JSON_COLS = {
   project_memory: ['content_json'],
   artifacts: ['meta_json'],
   project_events: ['payload_json'],
-  analysis_jobs: ['payload_json', 'result_json'],
+  analysis_jobs: ['payload_json', 'result_json', 'progress_json'],
 };
 
 /** boolean columns stored as INTEGER 0/1. */

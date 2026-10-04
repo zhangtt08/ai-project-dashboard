@@ -119,6 +119,29 @@ export function buildRouter(app) {
   // ── Projects ────────────────────────────────────────────────────────────
   r.get('/api/projects', ({ query }) => app.listProjects({ includeArchived: query.includeArchived === 'true' }).map((p) => app.projectCard(p)));
 
+  /**
+   * 失效路径的重新定位提案 —— 只读磁盘，不写任何东西。
+   * Each verdict is a fact a person can check themselves: the recorded path either exists or it
+   * does not, and a candidate either carries a project marker or it does not.
+   */
+  r.get('/api/projects/relocate/preview', async () => app.relocationPlan());
+
+  /** Apply confirmed relocations. Refuses an empty move list rather than guessing. */
+  r.post('/api/projects/relocate', async ({ body }) => {
+    const moves = Array.isArray(body.moves) ? body.moves.slice(0, 100) : [];
+    if (!moves.length) throw new ValidationError('moves 不能为空', [{ path: 'moves', message: '至少选择一个要改路径的项目' }]);
+    const out = await app.applyRelocations(moves);
+    // 一条都没落地却回 200，调用方就会以为改成了 —— 全拒必须照实回 4xx。
+    // 部分成功仍然 200 + 逐条结果：那才是"这几条成了、那几条没成"的真实形状。
+    if (!out?.applied && Array.isArray(out?.results) && out.results.length) {
+      throw new ValidationError(
+        `没有一条改路径成功：${out.results.map((x) => `${x.name || x.projectId}｜${x.reason || '未知原因'}`).join('；').slice(0, 400)}`,
+        out.results.map((x) => ({ path: `moves.${x.projectId}`, message: String(x.reason || '被拒') })),
+      );
+    }
+    return out;
+  });
+
   r.post('/api/projects', async ({ body }) => {
     const workspacePath = requireParam(body, 'workspacePath', { maxLength: 1000 });
     const project = await app.addProjectAndClassify(workspacePath, {
@@ -263,14 +286,18 @@ export function buildRouter(app) {
   r.post('/api/projects/:id/scan', ({ params, body }) => {
     needProject(app, params.id);
     const mode = body.mode === 'quick' ? 'quick' : 'full';
+    const type = mode === 'quick' ? JOB_TYPE.QUICK_SCAN : JOB_TYPE.FULL_SCAN;
+    // Clicking 重新扫描 twice must not start two builds in one directory: the second click gets
+    // the job that is already queued, and `deduped` tells the UI to say so instead of "已入队".
     const job = app.queue.enqueue({
       projectId: params.id,
-      type: mode === 'quick' ? JOB_TYPE.QUICK_SCAN : JOB_TYPE.FULL_SCAN,
+      type,
       payload: { projectId: params.id, runCommands: body.runCommands !== false, suites: body.suites },
       priority: body.priority !== undefined ? Number(body.priority) : 3,
       timeoutMs: mode === 'quick' ? 120000 : 900000,
+      dedupe: true,
     });
-    return { jobId: job.id, mode };
+    return { jobId: job.id, mode, deduped: !!job.reused, status: job.status };
   });
 
   r.post('/api/projects/:id/scan-sync', async ({ params, body }) => {
@@ -290,9 +317,34 @@ export function buildRouter(app) {
     };
   });
 
-  r.get('/api/jobs', ({ query }) => app.queue.list({ status: query.status || null, limit: Number(query.limit || 50) }));
-  r.post('/api/jobs/:id/cancel', ({ params }) => ({ cancelled: app.queue.cancel(params.id) }));
+  r.get('/api/jobs', ({ query }) => app.queue.list({ status: query.status || null, limit: Math.min(Number(query.limit || 50), 500) }));
+  /**
+   * Cancel. The queue kills the running command's process, and returns false for a job that
+   * already reached a terminal state — the response says which happened instead of always
+   * claiming success.
+   */
+  r.post('/api/jobs/:id/cancel', ({ params }) => {
+    const job = app.repo.get('analysis_jobs', params.id);
+    if (!job) throw new NotFoundError('job', params.id);
+    const cancelled = app.queue.cancel(params.id);
+    return { cancelled, jobId: params.id, status: (app.repo.get('analysis_jobs', params.id) || {}).status };
+  });
   r.get('/api/jobs/stats', () => app.queue.stats());
+
+  /** 队列历史导出 —— the same rows the page shows, as CSV, for a spreadsheet or a ticket. */
+  r.get('/api/jobs/export', ({ query }) => {
+    const rows = app.queue.list({ status: query.status || null, limit: Math.min(Number(query.limit || 500), 2000) });
+    const esc = (v) => {
+      const s = v === null || v === undefined ? '' : String(v);
+      return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = ['id', 'type', 'status', 'project_id', 'created_at', 'started_at', 'finished_at', 'attempts', 'timeout_ms', 'progress', 'error'];
+    const lines = [header.join(',')];
+    for (const j of rows) {
+      lines.push(header.map((k) => esc(k === 'progress' ? (j.progress && j.progress.label ? `${j.progress.step}/${j.progress.total} ${j.progress.label}` : '') : j[k])).join(','));
+    }
+    return { exportedAt: nowIso(), count: rows.length, filename: `commander-jobs-${Date.now()}.csv`, csv: lines.join('\r\n') };
+  });
 
   // ── Tasks ───────────────────────────────────────────────────────────────
   r.get('/api/projects/:id/tasks', ({ params, query }) => ({

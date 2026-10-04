@@ -128,7 +128,7 @@ export function setSystemPill() {
   if (!pill) return;
   clear(pill);
   const s = state.system;
-  if (!s) { pill.className = 'pill pill-idle'; pill.textContent = 'connecting…'; return; }
+  if (!s) { pill.className = 'pill pill-idle'; pill.textContent = '正在连接…'; return; }
   const active = (s.providers || []).find((p) => p.active);
   pill.className = `pill ${active && active.configured ? 'pill-ok' : 'pill-idle'}`;
   pill.appendChild(h('span', { text: `AI: ${active ? active.name : 'none'}` }));
@@ -149,7 +149,7 @@ export async function refreshShellData() {
     setSystemPill();
     renderNav();
   } catch (err) {
-    toast(`Shell refresh failed: ${err.message}`, 'error');
+    toast(`后台状态刷新失败：${err.message}`, 'error');
   }
 }
 
@@ -196,7 +196,7 @@ async function boot() {
   try {
     state.meta = await api.meta();
   } catch (err) {
-    toast(`Could not load API metadata: ${err.message}`, 'error');
+    toast(`接口元数据读取失败：${err.message}`, 'error');
   }
   await refreshShellData();
   renderSidebarTools();

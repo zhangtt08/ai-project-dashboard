@@ -67,7 +67,14 @@ export async function readJsonBody(req, { limit = 2 * 1024 * 1024 } = {}) {
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > limit) { reject(new ValidationError('request body too large', [{ path: 'body', message: `exceeds ${limit} bytes` }])); req.destroy(); return; }
+      if (size > limit) {
+        const error = new ValidationError('request body too large', [{ path: 'body', message: `exceeds ${limit} bytes` }]);
+        error.status = 413;
+        error.closeConnection = true;
+        chunks.length = 0;
+        reject(error);
+        return;
+      }
       chunks.push(c);
     });
     req.on('end', () => {
@@ -94,7 +101,7 @@ function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
   if (rel === '/' || rel === '') rel = '/index.html';
   const abs = path.join(WEB_ROOT, rel);
-  if (!abs.startsWith(WEB_ROOT)) { sendJson(res, 403, { error: { code: 'forbidden', message: 'path traversal denied' } }); return true; }
+  if (abs !== WEB_ROOT && !abs.startsWith(WEB_ROOT + path.sep)) { sendJson(res, 403, { error: { code: 'forbidden', message: 'path traversal denied' } }); return true; }
   if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return false;
   const ext = path.extname(abs).toLowerCase();
   const body = fs.readFileSync(abs);
@@ -112,8 +119,7 @@ function serveStatic(req, res, pathname) {
 export function createHttpServer({ router, app, cors = false }) {
   const server = http.createServer(async (req, res) => {
     const started = Date.now();
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathname = toPosix(url.pathname);
+    let pathname = '';
 
     if (cors) {
       res.setHeader('access-control-allow-origin', '*');
@@ -123,6 +129,12 @@ export function createHttpServer({ router, app, cors = false }) {
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     try {
+      const url = new URL(req.url, 'http://localhost');
+      pathname = toPosix(url.pathname);
+      if (!cors && req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) {
+        sendJson(res, 403, { error: { code: 'forbidden', message: 'cross-origin request denied' } });
+        return;
+      }
       if (pathname.startsWith('/api/')) {
         const matched = router.match(req.method, pathname);
         if (!matched) { sendJson(res, 404, { error: { code: 'not_found', message: `no route for ${req.method} ${pathname}` } }); return; }
@@ -138,7 +150,8 @@ export function createHttpServer({ router, app, cors = false }) {
       if (pathname.startsWith('/files/')) {
         const rel = pathname.slice('/files/'.length);
         const abs = path.join(app.dataDir, 'exports', rel);
-        if (!abs.startsWith(path.join(app.dataDir, 'exports'))) { sendJson(res, 403, { error: { code: 'forbidden', message: 'path traversal denied' } }); return; }
+        const exportRoot = path.join(app.dataDir, 'exports');
+        if (abs !== exportRoot && !abs.startsWith(exportRoot + path.sep)) { sendJson(res, 403, { error: { code: 'forbidden', message: 'path traversal denied' } }); return; }
         if (!fs.existsSync(abs)) { sendJson(res, 404, { error: { code: 'not_found', message: 'file not found' } }); return; }
         const body = fs.readFileSync(abs);
         res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'content-length': body.length });
@@ -150,6 +163,7 @@ export function createHttpServer({ router, app, cors = false }) {
       sendJson(res, 404, { error: { code: 'not_found', message: `not found: ${pathname}` } });
     } catch (err) {
       const e = normalizeError(err);
+      if (err.closeConnection) res.setHeader('connection', 'close');
       log.warn('request_failed', { method: req.method, path: pathname, code: e.code, status: e.status, message: e.message });
       if (!res.writableEnded) sendJson(res, e.status, { error: e.toJSON() });
     } finally {
