@@ -25,7 +25,7 @@ function walk(dir, out = []) {
   return out;
 }
 
-const files = [...walk(path.join(ROOT, 'src')), ...walk(path.join(ROOT, 'tests')), ...walk(path.join(ROOT, 'tools')), ...walk(path.join(ROOT, 'scripts'))];
+const files = [...walk(path.join(ROOT, 'src')), ...walk(path.join(ROOT, 'tests')), ...walk(path.join(ROOT, 'tools')), ...walk(path.join(ROOT, 'scripts')), ...walk(path.join(ROOT, 'agent'))];
 const rel = (p) => path.relative(ROOT, p).replace(/\\/g, '/');
 
 // 1 + 2 + 3

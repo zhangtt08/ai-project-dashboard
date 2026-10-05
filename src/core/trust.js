@@ -72,6 +72,10 @@ function trustedSource(project) {
   if (project.trusted_source === 'migration') return 'migration';
   if (project.trusted_source === 'demo') return 'demo';
   if (project.trusted_source === 'user') return 'user';
+  // The Agent tool commander.project.trust records this. It is a distinct provenance on
+  // purpose: "a person clicked it in the UI" and "a person told an agent to do it" have to be
+  // tellable apart afterwards, and folding them into 'user' would erase that.
+  if (project.trusted_source === 'agent') return 'agent';
   return 'unknown';
 }
 

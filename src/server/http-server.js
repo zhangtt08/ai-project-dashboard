@@ -10,6 +10,7 @@ import { normalizeError, NotFoundError, ValidationError } from '../domain/errors
 import { logger } from '../core/logger.js';
 import { toPosix } from '../core/util.js';
 import { createLocalGuard, guardPayload } from './local-guard.js';
+import { AgentError, contractCodeFor, errorEnvelope, toAgentError } from '../../agent/contract.mjs';
 
 const log = logger.child('http');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -147,7 +148,7 @@ export function createHttpServer({ router, app, guard = null } = {}) {
 
       if (pathname.startsWith('/api/')) {
         const matched = router.match(req.method, pathname);
-        if (!matched) { sendJson(res, 404, apiErrorPayload(pathname, { code: 'not_found', message: `no route for ${req.method} ${pathname}` })); return; }
+        if (!matched) { sendJson(res, 404, apiErrorPayload(pathname, { code: 'not_found', message: `no route for ${req.method} ${pathname}` }, null, app)); return; }
         const query = Object.fromEntries(url.searchParams.entries());
         const body = ['POST', 'PATCH', 'PUT'].includes(req.method) ? await readJsonBody(req) : {};
         const result = await matched.route.handler({ params: matched.params, query, body, req, res, app });
@@ -176,8 +177,7 @@ export function createHttpServer({ router, app, guard = null } = {}) {
       if (err.closeConnection) res.setHeader('connection', 'close');
       log.warn('request_failed', { method: req.method, path: pathname, code: e.code, status: e.status, message: e.message });
       if (!res.writableEnded) {
-        const body = apiErrorPayload(pathname, e.toJSON());
-        if (pathname.startsWith('/api/agent/')) body.error.available = agentToolNames(app);
+        const body = apiErrorPayload(pathname, e.toJSON(), e, app);
         sendJson(res, e.status, body);
       }
     } finally {
@@ -215,10 +215,26 @@ export function notFound(what, id) { throw new NotFoundError(what, id); }
  * instead return `{ok:false,error:{code,message}}` (docs/AGENT_API_STANDARD.md), and a
  * bare `{error}` there is a contract violation a tool caller cannot parse — which is exactly
  * what a malformed JSON body or an unmatched /api/agent/* route would otherwise produce.
+ *
+ * The code itself is mapped through the contract's table (`contractCodeFor`), the same one
+ * `POST /api/agent/tool` uses inside `executeAgentTool`. Otherwise the same failure would be
+ * called `validation_error` on the way in and `bad_input` from the tool runner — two names for
+ * one fact is precisely what an Agent cannot act on.
  */
-export function apiErrorPayload(pathname, error) {
-  if (typeof pathname === 'string' && pathname.startsWith('/api/agent/')) return { ok: false, error };
+export function apiErrorPayload(pathname, error, err = null, app = null) {
+  if (typeof pathname === 'string' && pathname.startsWith('/api/agent/')) return agentErrorPayload(error, err, app);
   return { error };
+}
+
+function agentErrorPayload(error, err, app) {
+  const mapped = err
+    ? toAgentError(err)
+    : new AgentError(contractCodeFor(error.code, error.status), error.message, error.hint || '');
+  if (mapped.code === 'unknown_tool' || !mapped.available) {
+    const names = agentToolNames(app);
+    if (names.length) mapped.available = names;
+  }
+  return errorEnvelope(mapped);
 }
 
 /** The tool-name list attached to agent-path failures, from the container, never hardcoded here. */

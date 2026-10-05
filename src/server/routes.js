@@ -12,15 +12,120 @@ import { regressionSummary } from '../core/engines/regression.js';
 import { defaultIgnoreList } from '../core/ignore-engine.js';
 import { truncate, toPosix, nowIso } from '../core/util.js';
 import { CATEGORY_DEFS } from '../core/categories.js';
+import {
+  AGENT_API_VERSION,
+  AGENT_PROJECT_ID,
+  AGENT_TOOL_NAMES,
+  AGENT_VERSION,
+  agentProjectInfo,
+  executeAgentTool,
+  listAgentTools,
+} from '../../agent/tools.mjs';
+import { agentHttpStatus, AgentError, errorEnvelope, toAgentError } from '../../agent/contract.mjs';
 
+/** 服务进程起来的那一刻，`uptime_ms` 的分母（契约要求健康检查给运行时长）。 */
+const BOOTED_AT = Date.now();
 
 function needProject(app, id) { return app.getProject(id); }
+
+/**
+ * 契约端点必须原样吐出 `{ok:true,data:…}` / `{ok:false,error:{code,message}}`。
+ * 这个仓库的外壳是把每个 handler 的返回值包成 `{data:…}`（见 http-server.js），界面上的
+ * `request()` 再解回 `payload.data`。四个契约端点走 `{__raw:true,status,payload}` 这条出口，
+ * 于是外壳绕不过去、界面也不受影响 —— 两边读的是同一份判定，只是不套同一个壳。
+ */
+function rawEnvelope(payload, status = 200) {
+  return { __raw: true, status, payload };
+}
+
+/**
+ * advertised 的 base_url：让换端口启动的服务不说错话。
+ * ⚠ 这不是防御，也别当防御用：Host 是不是回环、端口对不对、Origin 同不同源，全部在
+ * `src/server/local-guard.js` 里判过一次才走到这里。这里只做一次 localhost → 127.0.0.1 归一。
+ */
+function agentBaseUrl(req) {
+  const host = req && req.headers && typeof req.headers.host === 'string' ? req.headers.host.trim() : '';
+  if (!host) return '';
+  return `http://${host.replace(/^localhost/i, '127.0.0.1')}`;
+}
 
 export function buildRouter(app) {
   const r = new Router();
 
+  // The Agent tool names are served from the registry itself (agent/tools.mjs), never a copy,
+  // so the list attached to an /api/agent/* failure cannot disagree with the manifest.
+  app.agentApi = { available: AGENT_TOOL_NAMES, project: AGENT_PROJECT_ID, version: AGENT_VERSION };
+
+  const agentCtx = (req) => ({ app, baseUrl: agentBaseUrl(req), bootedAt: BOOTED_AT });
+
   // ── Meta ────────────────────────────────────────────────────────────────
-  r.get('/api/health', () => ({ ok: true, version: '0.9.0', at: nowIso() }));
+  /**
+   * `GET /api/health` —— 一份返回值，两个契约同时成立：
+   *  · personal-agent-hub《AGENT_API_STANDARD.md》：`{ok:true,data:{project,version,agent_api,uptime_ms}}`
+   *  · 这个仓库自己的既有契约：`data.ok === true`（tests/integration/api.test.js:66）与
+   *    `data.at`（src/web/api.js 一直在读的那份时间戳）
+   * version 取自 package.json（`AGENT_VERSION`），不再是写死的 '0.9.0'。
+   */
+  r.get('/api/health', () => rawEnvelope({
+    ok: true,
+    data: {
+      ...agentProjectInfo({ baseUrl: '', bootedAt: BOOTED_AT }),
+      ok: true,      // 本仓库自己的既有契约：data.ok === true（tests/integration/api.test.js:66）
+      at: nowIso(),  // 既有消费方：src/web/api.js 读的时间戳
+    },
+  }));
+
+  // ── Agent 契约（personal-agent-hub/docs/AGENT_API_STANDARD.md v1）──────────
+  // 就地并入现有服务：不新增端口、不另起进程。判据在 agent/tools.mjs，这里只做信封与状态码。
+  r.get('/api/agent/manifest', ({ req }) => rawEnvelope({
+    ok: true,
+    data: {
+      ...agentProjectInfo({ baseUrl: agentBaseUrl(req), bootedAt: BOOTED_AT }),
+      endpoints: {
+        health: 'GET /api/health',
+        manifest: 'GET /api/agent/manifest',
+        tools: 'GET /api/agent/tools',
+        tool: 'POST /api/agent/tool  body {"tool":"commander.projects.list","input":{…}}',
+      },
+      // 工具清单就是契约本体：原样透出 name/description/input_schema/risk。
+      tools: listAgentTools(),
+    },
+  }));
+
+  r.get('/api/agent/tools', () => rawEnvelope({ ok: true, data: listAgentTools() }));
+
+  r.post('/api/agent/tool', async ({ body, req }) => {
+    const started = Date.now();
+    try {
+      const out = await executeAgentTool(body.tool, body.input, agentCtx(req));
+      return rawEnvelope({ ok: true, data: out.data, tool: out.tool, risk: out.risk, ms: Date.now() - started });
+    } catch (err) {
+      // 调用方能修的问题（工具名写错、少传必填项、没 confirm）一律 4xx + 契约信封。
+      const e = toAgentError(err);
+      if (e.code === 'internal_error') {
+        // 服务端自己的错：日志里留全貌，响应里只留那句「这不是你的输入问题」。
+        const { logger } = await import('../core/logger.js');
+        logger.child('agent').warn('tool_internal_error', { tool: body && body.tool, message: err && err.message });
+      }
+      return rawEnvelope(errorEnvelope(e), agentHttpStatus(e.code));
+    }
+  });
+
+  /**
+   * 写错的 agent 路径出路：也必须是契约信封，绝不能落回 `{error:…}` 那种调用方解析不了的形状。
+   * 具体路由先注册，所以这条只兜「不存在的 /api/agent/*」。
+   */
+  const agentFallback = ({ req }) => {
+    const err = new AgentError(
+      'unknown_tool',
+      `Agent 契约只有四个端点：GET /api/health、GET /api/agent/manifest、GET /api/agent/tools、POST /api/agent/tool（收到 ${req.method} ${req.url}）。`,
+      '见 personal-agent-hub/docs/AGENT_API_STANDARD.md；工具清单在 GET /api/agent/tools。',
+    );
+    err.available = AGENT_TOOL_NAMES;
+    return rawEnvelope(errorEnvelope(err), 404);
+  };
+  for (const method of ['get', 'post', 'put', 'patch', 'delete']) r[method]('/api/agent/*', agentFallback);
+
   r.get('/api/system', () => app.systemInfo());
   r.get('/api/security', () => app.securityModel());
   r.get('/api/dashboard', () => app.dashboard());
@@ -294,29 +399,18 @@ export function buildRouter(app) {
    * Trust gate, applied at the boundary: `runCommands` from the client is a *request*, and the
    * project's trust is what decides. A scan of a folder nobody trusted still produces real
    * metadata, git, specs, risks and health — it just never executes their scripts.
+   *
+   * The judgment itself lives in `app.queueScan()` — the ONE implementation shared with the
+   * Agent tool `commander.project.scan`. Two copies of this rule is how one of them quietly
+   * becomes permissive; tests/integration/agent-api.test.js compares the two responses field
+   * by field so a fork turns red instead of drifting.
    */
-  r.post('/api/projects/:id/scan', ({ params, body }) => {
-    const project = needProject(app, params.id);
-    const mode = body.mode === 'quick' ? 'quick' : 'full';
-    const type = mode === 'quick' ? JOB_TYPE.QUICK_SCAN : JOB_TYPE.FULL_SCAN;
-    const gate = commandsAllowedFor(project, body.runCommands !== false);
-    // Clicking 重新扫描 twice must not start two builds in one directory: the second click gets
-    // the job that is already queued, and `deduped` tells the UI to say so instead of "已入队".
-    const job = app.queue.enqueue({
-      projectId: params.id,
-      type,
-      payload: { projectId: params.id, runCommands: gate.allowed, suites: body.suites },
-      priority: body.priority !== undefined ? Number(body.priority) : 3,
-      timeoutMs: mode === 'quick' ? 120000 : 900000,
-      dedupe: true,
-    });
-    return {
-      jobId: job.id, mode, deduped: !!job.reused, status: job.status,
-      runCommands: gate.allowed,
-      commandsSkippedReason: gate.allowed ? null : gate.reason,
-      trusted: gate.trusted,
-    };
-  });
+  r.post('/api/projects/:id/scan', ({ params, body }) => app.queueScan(params.id, {
+    mode: body.mode === 'quick' ? 'quick' : 'full',
+    runCommands: body.runCommands !== false,
+    suites: Array.isArray(body.suites) ? body.suites : null,
+    priority: body.priority !== undefined ? Number(body.priority) : 3,
+  }));
 
   r.post('/api/projects/:id/scan-sync', async ({ params, body }) => {
     const project = needProject(app, params.id);

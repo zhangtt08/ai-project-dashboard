@@ -227,6 +227,29 @@ export const AUTO_ALLOWED_SUMMARY = [
 const EXECUTABLE_CACHE = new Map();
 
 /**
+ * The spawn options this module uses, as a table so both halves of the cancellation story are
+ * testable on any machine.
+ *
+ * `detached` is the part that makes a POSIX group kill possible at all: it puts the child in its
+ * own process group with pgid === child.pid, which is what `process.kill(-pid)` then addresses.
+ * Without it there is no group, `process.kill(-pid)` throws ESRCH, and cancellation is a no-op
+ * that returns false while the build keeps running behind a card that says 已取消.
+ *
+ * Windows is deliberately NOT detached: `detached:true` there hands the child a new console, and
+ * the tree is walked with `taskkill /T /F` instead, which needs no group.
+ */
+export function spawnOptions({ cwd, env, platform = process.platform }) {
+  return {
+    cwd,
+    shell: false,
+    windowsHide: true,
+    detached: platform !== 'win32',
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  };
+}
+
+/**
  * Kill a command and everything it spawned.
  *
  * `child.kill()` only reaches the direct child. On Windows `npm run build` is a wrapper: the
@@ -234,10 +257,23 @@ const EXECUTABLE_CACHE = new Map();
  * the real build running behind a card that said 已取消 — and the next scan would race it.
  * `taskkill /T /F` walks the tree. It is invoked here as internal teardown only: `taskkill`
  * stays on DANGEROUS_BINARIES, so no user-detected command can ever reach it.
+ *
+ * On POSIX the equivalent is the process group (`-pid`), which exists because every child this
+ * module spawns is `detached` — see spawnOptions(). The bare pid is killed as well, because a
+ * group that is missing for some reason (an already-reaped leader, a container without process
+ * groups) must degrade into "kill what we can see", never into "did nothing and said true".
+ *
+ * @param {number|null|undefined} pid
+ * @param {{force?:boolean, platform?:string, killProcess?:(pid:number, signal:string)=>boolean}} [opts]
+ *        `platform`/`killProcess` are seams for tests; production calls use the defaults.
+ * @returns {boolean} whether something was actually signalled
  */
-export function killProcessTree(pid, { force = true } = {}) {
+export function killProcessTree(pid, { force = true, platform = process.platform, killProcess = null } = {}) {
   if (!pid) return false;
-  if (process.platform === 'win32') {
+  const signal = force ? 'SIGKILL' : 'SIGTERM';
+  const kill = killProcess || ((target, sig) => { process.kill(target, sig); return true; });
+
+  if (platform === 'win32') {
     try {
       const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])], {
         windowsHide: true, stdio: 'ignore', shell: false,
@@ -248,7 +284,21 @@ export function killProcessTree(pid, { force = true } = {}) {
       return false;
     }
   }
-  try { process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM'); return true; } catch { return false; }
+
+  let killed = false;
+  try {
+    kill(-pid, signal);
+    killed = true;
+  } catch {
+    // No process group — the pre-fix shape. Do not stop here; the leader is still alive.
+  }
+  try {
+    kill(pid, signal);
+    killed = true;
+  } catch {
+    // Already gone: ESRCH here is success by another name, not a failure to report.
+  }
+  return killed;
 }
 
 export function resolveExecutable(bin) {
@@ -425,16 +475,15 @@ export class CommandRunner {
     }
 
     const limit = timeoutMs || this.defaultTimeoutMs;
+    let childPid = null;
     const result = await new Promise((resolve) => {
       let child;
       try {
-        child = spawn(exe, spawnArgs, {
+        child = spawn(exe, spawnArgs, spawnOptions({
           cwd,
-          shell: false,
-          windowsHide: true,
           env: { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0', ...(env || {}) },
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
+        }));
+        childPid = child.pid ?? null;
       } catch (err) {
         resolve({ exitCode: -3, signal: null, stdout: '', stderr: `spawn failed: ${err.message}`, timedOut: false });
         return;

@@ -1,0 +1,23 @@
+{
+  "command": "node",
+  "args": [
+    "src/server/cli.js",
+    "start"
+  ],
+  "ready_port": 8787,
+  "ready_path": "/api/health",
+  "port_fallback": "端口被占时 src/server/cli.js 自己向上让位（8787 → 最多 +20），并把**实际**地址写进 <数据目录>/server-url.txt。所以调用方别拿 8787 当事实：agent/serve.mjs 会读那份文件、把真实 base 落到 agent/.endpoint，MCP 桥优先读 .endpoint（其次 AGENT_BASE_URL）。",
+  "data_dir": "COMMANDER_DATA_DIR 决定库与 server-url.txt / local-token.txt 的位置；缺省是 <仓库根>/data，也就是用户双击 启动.bat 时在用的那一份。要拿隔离实例做验证就把它指到临时目录。",
+  "env": {
+    "COMMANDER_DATA_DIR": "可选，数据目录",
+    "COMMANDER_PORT": "可选，覆盖 8787 这个默认端口",
+    "COMMANDER_LOCAL_TOKEN": "可选。一旦设置，所有非 GET 请求（含 POST /api/agent/tool）都要带 x-commander-token / Authorization: Bearer / ?token=；令牌同时被镜像到 <数据目录>/local-token.txt，agent/mcp-server.mjs 只从环境读值、从不打印",
+    "AGENT_BASE_URL": "可选，MCP 桥的首选地址（优先于 agent/.endpoint）"
+  },
+  "note": "Commander 是「就地接入」形状（personal-agent-hub/docs/AGENT_API_STANDARD.md 的 B 类）：Agent 契约的四个端点挂在项目自带的那一个服务上，没有第二个 agent 进程、没有第二个端口、没有第二份数据库连接。start 起的就是应用本体（双击 启动.bat 起的是同一个）。",
+  "never_kill": "任何包装脚本都不得杀 8787 上的进程：那可能是用户正在用的实时服务。端口被占的正确反应是复用健康检查或让位，不是清理。",
+  "dev_command": "npm run dev 起的是同一个 CLI（dev 子命令），同样 8787、同样四个端点可用。",
+  "docs": "工具清单与输入 schema 的真话只在 GET /api/agent/tools 里；见 agent/README.md 与 agent/tools.mjs。",
+  "probe_tool_query": "dashboard",
+  "_probe_tool_query_note": "\"_probe_note\": \"验收器真跑一次只读探路：commander.dashboard 是 risk=read、零必填、只读库内现状的工具。就地并入型必须点名安全工具。\","
+}

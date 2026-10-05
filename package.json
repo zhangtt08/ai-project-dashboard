@@ -18,7 +18,9 @@
     "test:unit": "node scripts/run-tests.js --unit",
     "test:integration": "node scripts/run-tests.js --integration",
     "test:e2e": "node scripts/run-e2e.js",
-    "verify": "node scripts/verify.js"
+    "verify": "node scripts/verify.js",
+    "agent:serve": "node agent/serve.mjs",
+    "agent:mcp": "node agent/mcp-server.mjs"
   },
   "dependencies": {},
   "devDependencies": {}

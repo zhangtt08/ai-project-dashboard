@@ -154,6 +154,7 @@ async function build() {
   walk(path.join(ROOT, 'tests'));
   walk(path.join(ROOT, 'tools'));
   walk(path.join(ROOT, 'scripts'));
+  walk(path.join(ROOT, 'agent'));
   const results = await checkSyntaxAll(files);
   for (const r of results) {
     if (!r.ok) errors.push(`${path.relative(ROOT, r.file).replace(/\\/g, '/')}: ${r.reason}`);
@@ -164,6 +165,12 @@ async function build() {
     if (!fs.existsSync(path.join(WEB_ROOT, f))) errors.push(`missing web asset: src/web/${f}`);
   }
   if (!fs.existsSync(path.join(ROOT, 'README.md'))) errors.push('missing README.md');
+  // The Agent delivery surface required by personal-agent-hub/docs/AGENT_API_STANDARD.md.
+  // Missing file = the portfolio says one thing and the disk says another, so this is a hard
+  // check, not a notice. Behaviour of the four endpoints is covered by the integration test.
+  for (const f of ['tools.mjs', 'contract.mjs', 'serve.mjs', 'mcp-server.mjs', 'launch.json', 'README.md']) {
+    if (!fs.existsSync(path.join(ROOT, 'agent', f))) errors.push(`missing agent contract file: agent/${f}`);
+  }
   for (const f of ['PROJECT_STATE.md', 'MASTER_PLAN.md', 'NEXT_ACTION.md', 'DECISIONS.md', 'TEST_STATUS.md', 'KNOWN_ISSUES.md', 'CHANGELOG_DEV.md', 'ARCHITECTURE.md', 'RECOVERY.md']) {
     if (!fs.existsSync(path.join(ROOT, 'docs', 'agent', f))) errors.push(`missing agent memory file: docs/agent/${f}`);
   }

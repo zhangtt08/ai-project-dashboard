@@ -43,7 +43,7 @@ import { OpenAICompatibleProvider } from './ai/openai-provider.js';
 import { StructuredRunner } from './ai/structured.js';
 import { AIService } from './ai/service.js';
 import { ensureDemoProjects, demoProjectDefinitions } from '../demo/fixture-factory.js';
-import { EVENT_TYPE, PROJECT_STATUS, PROJECT_HEALTH, DEFAULT_SCAN_LIMITS, SENSITIVE_PATTERNS } from '../domain/constants.js';
+import { EVENT_TYPE, JOB_TYPE, PROJECT_STATUS, PROJECT_HEALTH, DEFAULT_SCAN_LIMITS, SENSITIVE_PATTERNS } from '../domain/constants.js';
 import { newId, nowIso, toPosix } from './util.js';
 import { expandShortPath } from './fs-safe.js';
 import { commandsAllowedFor, trustPatch, trustState } from './trust.js';
@@ -273,6 +273,42 @@ export class App {
       trusted: Boolean(trusted), source: trusted ? source : null,
     });
     return { project: this.projectCard(updated), trust: trustState(this.repo.get('projects', projectId)) };
+  }
+
+  /**
+   * Queue a scan — the ONE place that turns "重新扫描" into an `analysis_jobs` row.
+   *
+   * Both entry points go through here: the web UI's `POST /api/projects/:id/scan` and the Agent
+   * tool `commander.project.scan`. That is deliberate. The trust gate, the dedupe rule ("点两次
+   * 重新扫描不许起两个构建") and the response shape are the same judgment, and the moment two
+   * callers each own a copy of it, one of them is quietly permissive. A test compares the two
+   * returned objects field-by-field (tests/integration/agent-api.test.js), so a fork here is red.
+   *
+   * @param {string} projectId
+   * @param {{mode?:'quick'|'full', runCommands?:boolean, suites?:string[]|null, priority?:number}} [opts]
+   */
+  queueScan(projectId, { mode = 'full', runCommands = true, suites = null, priority = 3 } = {}) {
+    const project = this.getProject(projectId);
+    const quick = mode === 'quick';
+    const type = quick ? JOB_TYPE.QUICK_SCAN : JOB_TYPE.FULL_SCAN;
+    // `runCommands` from the caller is a *request*; the project's trust is what decides.
+    const gate = commandsAllowedFor(project, runCommands !== false);
+    // A second click while one scan of the same folder is still queued gets that job back
+    // with `deduped: true`, so the caller can say "已经在跑了" instead of "已入队".
+    const job = this.queue.enqueue({
+      projectId,
+      type,
+      payload: { projectId, runCommands: gate.allowed, suites },
+      priority: Number(priority),
+      timeoutMs: quick ? 120000 : 900000,
+      dedupe: true,
+    });
+    return {
+      jobId: job.id, mode: quick ? 'quick' : 'full', deduped: !!job.reused, status: job.status,
+      runCommands: gate.allowed,
+      commandsSkippedReason: gate.allowed ? null : gate.reason,
+      trusted: gate.trusted,
+    };
   }
 
   /** Manual 分类 wins over inference until the user clears it back to auto. */
