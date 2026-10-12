@@ -22,3 +22,5 @@ desktop/vendor/
 
 # 桌面壳的可再生成产物（npm run build / desktop 构建脚本重出）
 desktop/AIProjectCommander.exe
+
+*.exe
